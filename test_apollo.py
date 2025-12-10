@@ -27,7 +27,7 @@ data = {
     "domain": target_domain,
     "organization_titles": ["ceo", "founder"],
     "reveal_personal_emails": True,
-    "reveal_phone_number": True
+    "reveal_phone_number": False
 }
 
 try:
@@ -40,6 +40,8 @@ try:
         person = json_resp.get("person")
         if person:
             print(f"✅ SUCCESS! Found: {person.get('name')}")
+            print(f"🔑 Top Level Keys: {list(json_resp.keys())}")
+            # print(f"📄 Full JSON: {json_resp}")
             print(f"📧 Email: {person.get('email')}")
         else:
             print("⚠️ Response valid 200 OK, but NO Person object found.")

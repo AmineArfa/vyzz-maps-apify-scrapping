@@ -21,117 +21,52 @@ st.set_page_config(
 
 # --- HELPER FUNCTIONS ---
 
-<<<<<<< HEAD
-def get_apify_credits(token):
-=======
 def get_apify_credits(token, debug=False):
->>>>>>> cursor/add-credit-monitoring-system-7392
     """
-    Fetch Apify monthly usage and limit.
+    Fetch Apify monthly usage and limit using two endpoints.
     Returns: (usage_usd, limit_usd) or (None, None) on error.
     """
-<<<<<<< HEAD
     try:
-        url = "https://api.apify.com/v2/users/me/usage/monthly"
         headers = {"Authorization": f"Bearer {token}"}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        usage_usd = data.get("data", {}).get("usageUsd", 0)
-        limit_usd = data.get("data", {}).get("limitUsd", 0)
+        
+        # 1. Get Limit from /users/me
+        limit_usd = 0
+        try:
+            url_me = "https://api.apify.com/v2/users/me"
+            resp_me = requests.get(url_me, headers=headers, timeout=10)
+            if resp_me.status_code == 200:
+                data_me = resp_me.json()
+                if debug:
+                    st.write("🔍 Apify /users/me data:", data_me)
+                limit_usd = data_me.get("data", {}).get("plan", {}).get("maxMonthlyUsageUsd", 0)
+        except Exception as e:
+            if debug: st.write(f"⚠️ Failed to fetch Apify limit: {e}")
+
+        # 2. Get Usage from /usage/monthly
+        usage_usd = 0
+        try:
+            url_usage = "https://api.apify.com/v2/users/me/usage/monthly"
+            resp_usage = requests.get(url_usage, headers=headers, timeout=10)
+            if resp_usage.status_code == 200:
+                data_usage = resp_usage.json()
+                if debug:
+                    st.write("🔍 Apify /usage/monthly data:", data_usage)
+                
+                # Try getting total usage (after discount is more accurate for billing)
+                usage_usd = data_usage.get("data", {}).get("totalUsageCreditsUsdAfterVolumeDiscount")
+                if usage_usd is None:
+                     usage_usd = data_usage.get("data", {}).get("totalUsageCreditsUsdBeforeVolumeDiscount", 0)
+        except Exception as e:
+            if debug: st.write(f"⚠️ Failed to fetch Apify usage: {e}")
+
         return float(usage_usd), float(limit_usd)
+
     except Exception as e:
-        st.warning(f"⚠️ Failed to fetch Apify credits: {e}")
+        if debug:
+            st.warning(f"⚠️ Failed to fetch Apify credits: {e}")
         return None, None
 
-def get_apollo_credits(api_key):
-=======
-    # Try multiple endpoints
-    endpoints = [
-        "https://api.apify.com/v2/users/me/usage/monthly",
-        "https://api.apify.com/v2/users/me",
-        "https://api.apify.com/v2/billing/usage"
-    ]
-    
-    for url in endpoints:
-        try:
-            headers = {"Authorization": f"Bearer {token}"}
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if debug:
-                st.write(f"🔍 Apify API Response from {url}:", data)
-            
-            # Helper function to safely get value (distinguish between 0 and missing)
-            def safe_get(obj, *keys):
-                for key in keys:
-                    if isinstance(obj, dict) and key in obj:
-                        val = obj[key]
-                        # Check if value exists (even if 0)
-                        if val is not None:
-                            return val
-                return None
-            
-            # Try different possible response structures
-            usage_usd = None
-            limit_usd = None
-            
-            # Structure 1: data.data.usageUsd (most common)
-            if "data" in data:
-                data_obj = data["data"]
-                if isinstance(data_obj, dict):
-                    usage_usd = safe_get(data_obj, "usageUsd", "usageUSD", "usage", "usedUsd", "usedUSD")
-                    limit_usd = safe_get(data_obj, "limitUsd", "limitUSD", "limit", "monthlyLimitUsd", "monthlyLimitUSD")
-            
-            # Structure 2: Direct in response
-            if usage_usd is None:
-                usage_usd = safe_get(data, "usageUsd", "usageUSD", "usage", "usedUsd")
-            if limit_usd is None:
-                limit_usd = safe_get(data, "limitUsd", "limitUSD", "limit", "monthlyLimitUsd")
-            
-            # Structure 3: Check for nested structure (array)
-            if usage_usd is None and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
-                first_item = data["data"][0]
-                usage_usd = safe_get(first_item, "usageUsd", "usageUSD")
-                limit_usd = safe_get(first_item, "limitUsd", "limitUSD")
-            
-            # Check if we found the values
-            if usage_usd is not None and limit_usd is not None:
-                # Convert to float (0 is valid)
-                return float(usage_usd), float(limit_usd)
-            else:
-                # Values not found in this endpoint, try next
-                if debug:
-                    st.write(f"⚠️ Values not found in {url}, trying next endpoint...")
-                continue
-                
-        except requests.exceptions.RequestException as e:
-            # Try next endpoint
-            if debug:
-                st.write(f"⚠️ Request error with endpoint {url}: {e}")
-            continue
-        except Exception as e:
-            if debug:
-                st.write(f"⚠️ Error with endpoint {url}: {e}")
-            continue
-    
-    # If all endpoints failed or didn't return valid data
-    st.warning(f"⚠️ Failed to fetch Apify credits from all endpoints. Enable debug mode to see details.")
-    if debug:
-        st.write("Tried endpoints:", endpoints)
-        with st.expander("🔍 Last API Response", expanded=True):
-            try:
-                url = endpoints[0]
-                headers = {"Authorization": f"Bearer {token}"}
-                response = requests.get(url, headers=headers, timeout=10)
-                st.json(response.json())
-            except:
-                st.write("Could not fetch last response")
-    return None, None
-
 def get_apollo_credits(api_key, debug=False):
->>>>>>> cursor/add-credit-monitoring-system-7392
     """
     Fetch Apollo credits from auth/health endpoint.
     Returns: (credits_left, credits_limit, credits_used) or (None, None, None) on error.
@@ -142,78 +77,34 @@ def get_apollo_credits(api_key, debug=False):
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
-<<<<<<< HEAD
-        user = data.get("user", {})
-        team = user.get("team", {})
-        credits_left = team.get("email_credits_left", 0)
-        credits_limit = team.get("email_credits_limit", 0)
-        credits_used = team.get("period_email_credits_usage", 0)
-        return int(credits_left), int(credits_limit), int(credits_used)
-    except Exception as e:
-        st.warning(f"⚠️ Failed to fetch Apollo credits: {e}")
-        return None, None, None
-
-def display_credit_dashboard(apify_token, apollo_key):
-=======
         
-        # Debug: Log the full response structure
         if debug:
             st.write("🔍 Apollo API Response:", data)
-        
-        # Helper function to safely get value (distinguish between 0 and missing)
-        def safe_get(obj, *keys):
-            for key in keys:
-                if isinstance(obj, dict) and key in obj:
-                    val = obj[key]
-                    # Check if value exists (even if 0)
-                    if val is not None:
-                        return val
-            return None
-        
-        # Try different possible response structures
-        credits_left = None
-        credits_limit = None
-        credits_used = None
-        
-        # Structure 1: data.user.team.email_credits_left (most common)
+            
+        # Since logic to parse credits varies wildly or is unavailable, we just return None calmly
+        # unless we find the exact structure we look for.
         user = data.get("user", {})
-        if user:
-            team = user.get("team", {})
-            if team:
-                credits_left = safe_get(team, "email_credits_left", "credits_left", "remaining_credits", "emailCreditsLeft")
-                credits_limit = safe_get(team, "email_credits_limit", "credits_limit", "total_credits", "emailCreditsLimit")
-                credits_used = safe_get(team, "period_email_credits_usage", "credits_used", "used_credits", "periodEmailCreditsUsage")
+        team = user.get("team", {})
         
-        # Structure 2: Direct in user object
-        if credits_left is None and user:
-            credits_left = safe_get(user, "email_credits_left", "credits_left", "emailCreditsLeft")
-            credits_limit = safe_get(user, "email_credits_limit", "credits_limit", "emailCreditsLimit")
-            credits_used = safe_get(user, "period_email_credits_usage", "credits_used", "periodEmailCreditsUsage")
+        email_credits_left = team.get("email_credits_left")
+        email_credits_limit = team.get("email_credits_limit")
+        period_email_credits_usage = team.get("period_email_credits_usage")
         
-        # Structure 3: Direct in response
-        if credits_left is None:
-            credits_left = safe_get(data, "email_credits_left", "credits_left", "emailCreditsLeft")
-            credits_limit = safe_get(data, "email_credits_limit", "credits_limit", "emailCreditsLimit")
-            credits_used = safe_get(data, "period_email_credits_usage", "credits_used", "periodEmailCreditsUsage")
+        if email_credits_left is not None:
+             return int(email_credits_left), int(email_credits_limit or 0), int(period_email_credits_usage or 0)
         
-        # Check if we found the values
-        if credits_left is None or credits_limit is None:
-            with st.expander("🔍 Debug: Apollo API Response", expanded=True):
-                st.json(data)
-                st.write("**Trying to find:** email_credits_left, email_credits_limit")
-            st.warning(f"⚠️ Apollo API response structure unexpected. Check debug info above.")
-            return None, None, None
-        
-        # Convert to int (0 is valid)
-        return int(credits_left), int(credits_limit), int(credits_used or 0)
-    except Exception as e:
-        st.warning(f"⚠️ Failed to fetch Apollo credits: {e}")
+        # If we reached here, we didn't find the credits.
         if debug:
-            st.exception(e)
+            st.warning("⚠️ Apollo credits structure match failed.")
+        
+        return None, None, None
+
+    except Exception as e:
+        if debug:
+            st.warning(f"⚠️ Failed to fetch Apollo credits: {e}")
         return None, None, None
 
 def display_credit_dashboard(apify_token, apollo_key, debug=False):
->>>>>>> cursor/add-credit-monitoring-system-7392
     """
     Display credit dashboard with color-coded metrics.
     Shows Apify USD usage and Apollo credits remaining.
@@ -222,17 +113,10 @@ def display_credit_dashboard(apify_token, apollo_key, debug=False):
     st.sidebar.header("💰 Credit Dashboard")
     
     # Fetch Apify credits
-<<<<<<< HEAD
-    apify_usage, apify_limit = get_apify_credits(apify_token)
-    
-    # Fetch Apollo credits
-    apollo_left, apollo_limit, apollo_used = get_apollo_credits(apollo_key)
-=======
     apify_usage, apify_limit = get_apify_credits(apify_token, debug=debug)
     
     # Fetch Apollo credits
     apollo_left, apollo_limit, apollo_used = get_apollo_credits(apollo_key, debug=debug)
->>>>>>> cursor/add-credit-monitoring-system-7392
     
     # Apify Display
     if apify_usage is not None and apify_limit is not None:
@@ -512,14 +396,9 @@ def execute_with_credit_tracking(secrets, table_leads, table_log, industry, city
     where result_data contains: total_scraped, new_added, new_records, status, error_msg
     """
     # Step 1: Snapshot Pre-Credits
-<<<<<<< HEAD
-    apify_usage_pre, apify_limit_pre = get_apify_credits(secrets["apify_token"])
-    apollo_left_pre, apollo_limit_pre, apollo_used_pre = get_apollo_credits(secrets["apollo_key"])
-=======
     debug_mode = st.session_state.get("debug_mode", False)
     apify_usage_pre, apify_limit_pre = get_apify_credits(secrets["apify_token"], debug=debug_mode)
     apollo_left_pre, apollo_limit_pre, apollo_used_pre = get_apollo_credits(secrets["apollo_key"], debug=debug_mode)
->>>>>>> cursor/add-credit-monitoring-system-7392
     
     # Initialize result tracking
     result_data = {
@@ -605,14 +484,9 @@ def execute_with_credit_tracking(secrets, table_leads, table_log, industry, city
         st.error(f"An error occurred: {e}")
     
     # Step 3: Snapshot Post-Credits
-<<<<<<< HEAD
-    apify_usage_post, apify_limit_post = get_apify_credits(secrets["apify_token"])
-    apollo_left_post, apollo_limit_post, apollo_used_post = get_apollo_credits(secrets["apollo_key"])
-=======
     debug_mode = st.session_state.get("debug_mode", False)
     apify_usage_post, apify_limit_post = get_apify_credits(secrets["apify_token"], debug=debug_mode)
     apollo_left_post, apollo_limit_post, apollo_used_post = get_apollo_credits(secrets["apollo_key"], debug=debug_mode)
->>>>>>> cursor/add-credit-monitoring-system-7392
     
     # Step 4: Calculate Delta
     credit_used_apify = None
@@ -673,17 +547,12 @@ def main():
     if secrets["apollo_key"]:
         st.sidebar.success("Apollo Key Found")
     
-<<<<<<< HEAD
-    # Display Credit Dashboard
-    display_credit_dashboard(secrets["apify_token"], secrets["apollo_key"])
-=======
     # Debug mode toggle
     debug_mode = st.sidebar.checkbox("🔍 Debug Mode", value=False, help="Show API response details")
     st.session_state["debug_mode"] = debug_mode
     
     # Display Credit Dashboard
     display_credit_dashboard(secrets["apify_token"], secrets["apollo_key"], debug=debug_mode)
->>>>>>> cursor/add-credit-monitoring-system-7392
 
     # Initialization
     if "industry_options" not in st.session_state:
@@ -763,11 +632,7 @@ def main():
         with st.sidebar:
             st.markdown("---")
             st.caption("🔄 Refreshing credit dashboard...")
-<<<<<<< HEAD
-        display_credit_dashboard(secrets["apify_token"], secrets["apollo_key"])
-=======
         display_credit_dashboard(secrets["apify_token"], secrets["apollo_key"], debug=st.session_state.get("debug_mode", False))
->>>>>>> cursor/add-credit-monitoring-system-7392
 
 if __name__ == "__main__":
     main()
