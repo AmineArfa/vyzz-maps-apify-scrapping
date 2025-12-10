@@ -1,4 +1,40 @@
 import streamlit as st
+import sys
+import subprocess
+
+# DEBUG: Check if apify-client is installed
+st.sidebar.write("### 🔍 Debug Info")
+st.sidebar.write(f"Python: {sys.version.split()[0]}")
+st.sidebar.write(f"Executable: {sys.executable}")
+
+# Check installed packages
+try:
+    result = subprocess.run([sys.executable, "-m", "pip", "list"], 
+                          capture_output=True, text=True, timeout=10)
+    installed_packages = result.stdout.lower()
+    if "apify-client" in installed_packages:
+        st.sidebar.success("✅ apify-client found in pip list")
+        # Extract version
+        import re
+        match = re.search(r'apify-client\s+([\d.]+)', installed_packages)
+        if match:
+            st.sidebar.write(f"Version: {match.group(1)}")
+    else:
+        st.sidebar.error("❌ apify-client NOT in pip list")
+        st.sidebar.code(installed_packages[:500])  # Show first 500 chars
+except Exception as e:
+    st.sidebar.warning(f"Could not check packages: {e}")
+
+# Try importing (this will show in sidebar, but app will still try to import below)
+try:
+    import apify_client
+    st.sidebar.success(f"✅ apify_client import successful (v{getattr(apify_client, '__version__', 'unknown')})")
+except ImportError as e:
+    st.sidebar.error(f"❌ Import failed: {e}")
+    st.sidebar.write("### sys.path:")
+    for p in sys.path[:5]:  # Show first 5 paths
+        st.sidebar.write(f"- {p}")
+
 import pandas as pd
 import requests
 from apify_client import ApifyClient
