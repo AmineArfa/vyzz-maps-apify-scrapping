@@ -205,12 +205,12 @@ def enrich_apollo(api_key, domain):
                 st.write(f"👉 found: {best_name} ({best_title}) [ID: {best_id}]")
             else:
                 st.write("⚠️ Search found 0 results.")
-                return None, None, None, None
+                return None, None, None
         else:
-            return None, None, None, None
+            return None, None, None
             
     except Exception:
-        return None, None, None, None
+        return None, None, None
 
     # Step 2: Unlock with Match using the Exact Person ID
     if best_id:
