@@ -21,6 +21,110 @@ st.set_page_config(
 
 # --- HELPER FUNCTIONS ---
 
+def get_apify_credits(token):
+    """
+    Fetch Apify monthly usage and limit.
+    Returns: (usage_usd, limit_usd) or (None, None) on error.
+    """
+    try:
+        url = "https://api.apify.com/v2/users/me/usage/monthly"
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        usage_usd = data.get("data", {}).get("usageUsd", 0)
+        limit_usd = data.get("data", {}).get("limitUsd", 0)
+        return float(usage_usd), float(limit_usd)
+    except Exception as e:
+        st.warning(f"⚠️ Failed to fetch Apify credits: {e}")
+        return None, None
+
+def get_apollo_credits(api_key):
+    """
+    Fetch Apollo credits from auth/health endpoint.
+    Returns: (credits_left, credits_limit, credits_used) or (None, None, None) on error.
+    """
+    try:
+        url = "https://api.apollo.io/v1/auth/health"
+        headers = {"X-Api-Key": api_key}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        user = data.get("user", {})
+        team = user.get("team", {})
+        credits_left = team.get("email_credits_left", 0)
+        credits_limit = team.get("email_credits_limit", 0)
+        credits_used = team.get("period_email_credits_usage", 0)
+        return int(credits_left), int(credits_limit), int(credits_used)
+    except Exception as e:
+        st.warning(f"⚠️ Failed to fetch Apollo credits: {e}")
+        return None, None, None
+
+def display_credit_dashboard(apify_token, apollo_key):
+    """
+    Display credit dashboard with color-coded metrics.
+    Shows Apify USD usage and Apollo credits remaining.
+    """
+    st.sidebar.markdown("---")
+    st.sidebar.header("💰 Credit Dashboard")
+    
+    # Fetch Apify credits
+    apify_usage, apify_limit = get_apify_credits(apify_token)
+    
+    # Fetch Apollo credits
+    apollo_left, apollo_limit, apollo_used = get_apollo_credits(apollo_key)
+    
+    # Apify Display
+    if apify_usage is not None and apify_limit is not None:
+        apify_remaining = apify_limit - apify_usage
+        apify_percent = (apify_remaining / apify_limit * 100) if apify_limit > 0 else 0
+        
+        # Color coding: red if < 20%, orange if < 40%, else normal
+        if apify_percent < 20:
+            apify_color = "🔴"
+        elif apify_percent < 40:
+            apify_color = "🟠"
+        else:
+            apify_color = "🟢"
+        
+        st.sidebar.metric(
+            label=f"{apify_color} Apify Usage",
+            value=f"${apify_usage:.2f}",
+            delta=f"${apify_limit:.2f} limit"
+        )
+        st.sidebar.caption(f"Remaining: ${apify_remaining:.2f} ({apify_percent:.1f}%)")
+    else:
+        st.sidebar.metric(
+            label="🔴 Apify Usage",
+            value="N/A",
+            delta="Unable to fetch"
+        )
+    
+    # Apollo Display
+    if apollo_left is not None and apollo_limit is not None:
+        apollo_percent = (apollo_left / apollo_limit * 100) if apollo_limit > 0 else 0
+        
+        # Color coding: red if < 20%, orange if < 40%, else normal
+        if apollo_percent < 20:
+            apollo_color = "🔴"
+        elif apollo_percent < 40:
+            apollo_color = "🟠"
+        else:
+            apollo_color = "🟢"
+        
+        st.sidebar.metric(
+            label=f"{apollo_color} Apollo Credits",
+            value=f"{apollo_left:,}",
+            delta=f"{apollo_limit:,} total"
+        )
+        st.sidebar.caption(f"Used: {apollo_used:,} ({100 - apollo_percent:.1f}%)")
+    else:
+        st.sidebar.metric(
+            label="🔴 Apollo Credits",
+            value="N/A",
+            delta="Unable to fetch"
+        )
+
 def get_secrets():
     """Safely retrieve secrets or show error."""
     try:
@@ -241,11 +345,123 @@ def enrich_apollo(api_key, domain):
 
     return best_name, None, best_title # Return partial info if unlock fails
 
-
-def log_transaction(table_log, industry, city_input, total_scraped, new_added, enrich_used, status, error_msg=""):
-    """Write log entry to Airtable."""
+def execute_with_credit_tracking(secrets, table_leads, table_log, industry, city_input, max_leads, enrich_emails):
+    """
+    Wrapper function that tracks credit usage before and after execution.
+    Returns: (result_data, credit_used_apify, credit_used_apollo)
+    where result_data contains: total_scraped, new_added, new_records, status, error_msg
+    """
+    # Step 1: Snapshot Pre-Credits
+    apify_usage_pre, apify_limit_pre = get_apify_credits(secrets["apify_token"])
+    apollo_left_pre, apollo_limit_pre, apollo_used_pre = get_apollo_credits(secrets["apollo_key"])
+    
+    # Initialize result tracking
+    result_data = {
+        "total_scraped": 0,
+        "new_added": 0,
+        "new_records": [],
+        "status": "Failed",
+        "error_msg": ""
+    }
+    
     try:
-        table_log.create({
+        # Step 2: Execute Main Logic
+        # 1. Fetch Existing (Deduplication)
+        exist_webs, exist_phones = fetch_existing_leads(table_leads)
+        
+        # 2. Scrape Apify
+        raw_leads = scrape_apify(secrets["apify_token"], industry, city_input, max_leads)
+        total_scraped = len(raw_leads)
+        result_data["total_scraped"] = total_scraped
+        
+        # 3. Process & Filter
+        new_records = []
+        
+        for item in raw_leads:
+            website = item.get("website")
+            map_phone = item.get("phoneNumber") or item.get("phone") or item.get("internationalPhoneNumber")
+            
+            # Check Deduplication
+            clean_web = str(website).strip().lower() if website else None
+            clean_phone = "".join(filter(str.isdigit, str(map_phone))) if map_phone else None
+            
+            if (clean_web and clean_web in exist_webs) or (clean_phone and clean_phone in exist_phones):
+                continue
+
+            # Address Parsing
+            parsed_city, parsed_state = parse_address_components(item.get("address"), city_input)
+                
+            # Schema Mapping
+            record = {
+                "company_name": item.get("title"),
+                "industry": industry,
+                "city": parsed_city,
+                "state": parsed_state,
+                "website": website,
+                "generic_phone": map_phone,
+                "rating": item.get("totalScore"),
+                "postal_address": item.get("address"),
+                "scrapping_tool": SCRAPPING_TOOL_ID,
+                "key_contact_name": None,
+                "key_contact_email": None,
+                "key_contact_position": None
+            }
+            
+            # 4. Enrichment
+            if clean_web and enrich_emails:
+                apollo_domain = clean_web.split('?')[0].split('#')[0]
+                st.write(f"⏳ Debug: Enriching {item.get('title')} ({apollo_domain})...")
+                name, email, position = enrich_apollo(secrets["apollo_key"], apollo_domain)
+                
+                if name: record["key_contact_name"] = name
+                if email: record["key_contact_email"] = email
+                if position: record["key_contact_position"] = position
+            elif not clean_web:
+                st.write(f"💨 Debug: Skipped enrichment for {item.get('title')} (No Website)")
+                    
+            new_records.append(record)
+            
+            # Add to local cache to prevent dupes within same run
+            if clean_web: exist_webs.add(clean_web)
+            if clean_phone: exist_phones.add(clean_phone)
+        
+        # 5. Sync to Airtable
+        if new_records:
+            table_leads.batch_create(new_records)
+        
+        result_data["new_added"] = len(new_records)
+        result_data["new_records"] = new_records
+        result_data["status"] = "Success" if new_records or total_scraped > 0 else "Zero Results"
+        
+    except Exception as e:
+        result_data["status"] = "Failed"
+        result_data["error_msg"] = str(e)
+        st.error(f"An error occurred: {e}")
+    
+    # Step 3: Snapshot Post-Credits
+    apify_usage_post, apify_limit_post = get_apify_credits(secrets["apify_token"])
+    apollo_left_post, apollo_limit_post, apollo_used_post = get_apollo_credits(secrets["apollo_key"])
+    
+    # Step 4: Calculate Delta
+    credit_used_apify = None
+    credit_used_apollo = None
+    
+    if apify_usage_pre is not None and apify_usage_post is not None:
+        credit_used_apify = apify_usage_post - apify_usage_pre
+        if credit_used_apify < 0:
+            credit_used_apify = 0  # Handle edge case where usage might decrease (reset)
+    
+    if apollo_left_pre is not None and apollo_left_post is not None:
+        credit_used_apollo = apollo_left_pre - apollo_left_post
+        if credit_used_apollo < 0:
+            credit_used_apollo = 0  # Handle edge case
+    
+    return result_data, credit_used_apify, credit_used_apollo
+
+def log_transaction(table_log, industry, city_input, total_scraped, new_added, enrich_used, status, error_msg="", credit_used_apify=None, credit_used_apollo=None):
+    """Write log entry to Airtable with credit tracking."""
+    try:
+        log_data = {
             "Industry": industry,
             "City Input": city_input,
             "Total Scraped": total_scraped,
@@ -253,7 +469,15 @@ def log_transaction(table_log, industry, city_input, total_scraped, new_added, e
             "Enrichment Used?": enrich_used,
             "Status": status,
             "Error Message": str(error_msg)
-        })
+        }
+        
+        # Add credit usage if provided
+        if credit_used_apify is not None:
+            log_data["credit_used_apify"] = float(credit_used_apify)
+        if credit_used_apollo is not None:
+            log_data["credit_used_apollo"] = int(credit_used_apollo)
+        
+        table_log.create(log_data)
     except Exception as e:
         st.error(f"Failed to write log: {e}")
 
@@ -276,6 +500,9 @@ def main():
     
     if secrets["apollo_key"]:
         st.sidebar.success("Apollo Key Found")
+    
+    # Display Credit Dashboard
+    display_credit_dashboard(secrets["apify_token"], secrets["apollo_key"])
 
     # Initialization
     if "industry_options" not in st.session_state:
@@ -305,117 +532,57 @@ def main():
         status_text = st.empty()
         progress_bar = st.progress(0)
         
-        try:
-            # 1. Fetch Existing (Deduplication)
-            status_text.text("Fetching existing records for deduplication...")
-            exist_webs, exist_phones = fetch_existing_leads(table_leads)
+        # Execute with credit tracking
+        status_text.text("Initializing credit tracking...")
+        progress_bar.progress(5)
+        
+        result_data, credit_used_apify, credit_used_apollo = execute_with_credit_tracking(
+            secrets, table_leads, table_log, industry, city_input, max_leads, enrich_emails
+        )
+        
+        progress_bar.progress(95)
+        
+        # Log transaction with credit usage
+        log_transaction(
+            table_log,
+            industry,
+            city_input,
+            result_data["total_scraped"],
+            result_data["new_added"],
+            enrich_emails,
+            result_data["status"],
+            error_msg=result_data["error_msg"],
+            credit_used_apify=credit_used_apify,
+            credit_used_apollo=credit_used_apollo
+        )
+        
+        progress_bar.progress(100)
+        
+        # Display results
+        if result_data["status"] == "Success" or result_data["status"] == "Zero Results":
+            credit_info = []
+            if credit_used_apify is not None:
+                credit_info.append(f"Apify: ${credit_used_apify:.4f}")
+            if credit_used_apollo is not None:
+                credit_info.append(f"Apollo: {credit_used_apollo} credits")
             
-            # 2. Scrape Apify
-            status_text.text("Scraping Google Maps via Apify...")
-            raw_leads = scrape_apify(secrets["apify_token"], industry, city_input, max_leads)
-            total_scraped = len(raw_leads)
-            progress_bar.progress(30)
-            
-            # 3. Process & Filter
-            new_records = []
-            
-            status_text.text(f"Processing {total_scraped} raw leads...")
-            
-            for item in raw_leads:
-                website = item.get("website")
-                # Scrape Map Phone
-                map_phone = item.get("phoneNumber") or item.get("phone") or item.get("internationalPhoneNumber")
-                
-                # Check Deduplication
-                clean_web = str(website).strip().lower() if website else None
-                clean_phone = "".join(filter(str.isdigit, str(map_phone))) if map_phone else None
-                
-                if (clean_web and clean_web in exist_webs) or (clean_phone and clean_phone in exist_phones):
-                    continue
-
-                # Address Parsing
-                parsed_city, parsed_state = parse_address_components(item.get("address"), city_input)
-                    
-                # Schema Mapping
-                record = {
-                    "company_name": item.get("title"),
-                    "industry": industry,
-                    "city": parsed_city,
-                    "state": parsed_state,
-                    "website": website,
-                    "generic_phone": map_phone, # Generic from Maps
-                    "rating": item.get("totalScore"),
-                    "postal_address": item.get("address"),
-                    "scrapping_tool": SCRAPPING_TOOL_ID,
-                    "key_contact_name": None,
-                    "key_contact_email": None,
-                    "key_contact_position": None
-                }
-                
-                # 4. Enrichment
-                if clean_web and enrich_emails:
-                    # FIX: Strip UTM parameters from URL before sending to Apollo
-                    apollo_domain = clean_web.split('?')[0].split('#')[0]
-                    st.write(f"⏳ Debug: Enriching {item.get('title')} ({apollo_domain})...")
-                    name, email, position = enrich_apollo(secrets["apollo_key"], apollo_domain)
-                    
-                    if name: record["key_contact_name"] = name
-                    if email: record["key_contact_email"] = email
-                    if position: record["key_contact_position"] = position # New column mapping
-                elif not clean_web:
-                    st.write(f"💨 Debug: Skipped enrichment for {item.get('title')} (No Website)")
-                        
-                new_records.append(record)
-                
-                # Add to local cache to prevent dupes within same run
-                if clean_web: exist_webs.add(clean_web)
-                if clean_phone: exist_phones.add(clean_phone)
-                
-            progress_bar.progress(70)
-            
-            # 5. Sync to Airtable
-            status_text.text(f"Syncing {len(new_records)} new leads to Airtable...")
-            if new_records:
-                # Batch create handles chunks of 10 automatically in pyairtable usually
-                table_leads.batch_create(new_records)
-            
-            progress_bar.progress(90)
-            
-            # 6. Log Success
-            log_transaction(
-                table_log, 
-                industry, 
-                city_input, 
-                total_scraped, 
-                len(new_records), 
-                enrich_emails, 
-                "Success" if new_records or total_scraped > 0 else "Zero Results"
+            credit_str = f" ({', '.join(credit_info)})" if credit_info else ""
+            status_text.success(
+                f"✅ Scraped {result_data['total_scraped']}, Added {result_data['new_added']}.{credit_str}"
             )
             
-            progress_bar.progress(100)
-            status_text.success(f"✅ Scraped {total_scraped}, Added {len(new_records)}. (Log updated).")
-            
-            if new_records:
-                st.dataframe(pd.DataFrame(new_records))
+            if result_data["new_records"]:
+                st.dataframe(pd.DataFrame(result_data["new_records"]))
             else:
                 st.info("No new unique leads found.")
-                
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-            # Log Failure
-            try:
-                log_transaction(
-                    table_log, 
-                    industry, 
-                    city_input, 
-                    0, 
-                    0, 
-                    enrich_emails, 
-                    "Failed", 
-                    error_msg=str(e)
-                )
-            except:
-                pass
+        else:
+            status_text.error(f"❌ Execution failed: {result_data['error_msg']}")
+        
+        # Refresh credit dashboard after execution
+        with st.sidebar:
+            st.markdown("---")
+            st.caption("🔄 Refreshing credit dashboard...")
+        display_credit_dashboard(secrets["apify_token"], secrets["apollo_key"])
 
 if __name__ == "__main__":
     main()
