@@ -89,13 +89,14 @@ def execute_with_credit_tracking(
                 dashboard.update_metric("Skipped")
                 continue
 
-            parsed_city, parsed_state = parse_address_components(item.get("address"), city_input)
+            parsed_city, parsed_state, parsed_postal_code = parse_address_components(item.get("address"), city_input)
 
             record = {
                 "company_name": title,
                 "industry": industry,
                 "city": parsed_city,
                 "state": parsed_state,
+                "postal_code": parsed_postal_code,
                 "website": website,
                 "generic_phone": map_phone,
                 "rating": item.get("totalScore"),
