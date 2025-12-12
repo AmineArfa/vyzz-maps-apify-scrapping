@@ -8,7 +8,7 @@ import time
 import re
 
 # --- CONSTANTS & CONFIGURATION ---
-AIRTABLE_TABLE_NAME = "Leads_Scrapping"
+AIRTABLE_TABLE_NAME = "tblKrC9hOxCuMMyZT"
 AIRTABLE_LOG_TABLE_NAME = "log"
 SCRAPPING_TOOL_ID = "maps_apify_apollo"
 
@@ -203,7 +203,8 @@ def get_industry_options(api_key, base_id):
         tables = response.json().get("tables", [])
         
         for table in tables:
-            if table["name"] == AIRTABLE_TABLE_NAME:
+            # Match by ID (preferred) or Name
+            if table["id"] == AIRTABLE_TABLE_NAME or table["name"] == AIRTABLE_TABLE_NAME:
                 for field in table["fields"]:
                     if field["name"] == "industry":
                         # Check for singleSelect or multipleSelect options
