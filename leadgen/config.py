@@ -1,4 +1,5 @@
 import streamlit as st
+import os
 
 
 def get_secrets():
@@ -10,6 +11,8 @@ def get_secrets():
             "apify_token": st.secrets["APIFY_TOKEN"],
             "apollo_key": st.secrets["APOLLO_API_KEY"],
             "instantly_key": st.secrets.get("INSTANTLY_API_KEY", ""),
+            # Optional: Gemini key for zone splitting. Prefer Streamlit secrets; fallback to env var.
+            "gemini_key": (st.secrets.get("GOOGLE_GENERATIVE_AI_API_KEY", "") or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY", "")).strip(),
         }
     except FileNotFoundError:
         st.error("Secrets file not found. Please create `.streamlit/secrets.toml`.")

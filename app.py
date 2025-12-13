@@ -42,8 +42,22 @@ def main():
     else:
         st.sidebar.warning("Instantly Key Missing")
 
+    if secrets.get("gemini_key"):
+        st.sidebar.success("Gemini Key Found")
+    else:
+        st.sidebar.warning("Gemini Key Missing (split disabled)")
+
     debug_mode = st.sidebar.checkbox("🔍 Debug Mode", value=False, help="Show API response details")
     st.session_state["debug_mode"] = debug_mode
+
+    use_gemini_split_default = bool(secrets.get("gemini_key"))
+    use_gemini_split = st.sidebar.checkbox(
+        "🧩 Use Gemini Split (10 zones)",
+        value=use_gemini_split_default,
+        help="Splits the location into 10 sub-zones to increase Google Maps coverage. Falls back to single query on any Gemini error.",
+        disabled=not bool(secrets.get("gemini_key")),
+    )
+    st.session_state["use_gemini_split"] = use_gemini_split
 
     display_credit_dashboard(
         secrets["apify_token"],

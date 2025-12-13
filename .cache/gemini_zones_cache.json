@@ -1,0 +1,17 @@
+{
+  "models/gemini-flash-lite-latest::san francisco": {
+    "ts": 1765622510.427781,
+    "zones": [
+      "Sunset District, San Francisco, CA, USA",
+      "Richmond District, San Francisco, CA, USA",
+      "Mission District, San Francisco, CA, USA",
+      "Marina District, San Francisco, CA, USA",
+      "Nob Hill, San Francisco, CA, USA",
+      "SoMa (South of Market), San Francisco, CA, USA",
+      "Chinatown, San Francisco, CA, USA",
+      "North Beach, San Francisco, CA, USA",
+      "Pacific Heights, San Francisco, CA, USA",
+      "Tenderloin, San Francisco, CA, USA"
+    ]
+  }
+}

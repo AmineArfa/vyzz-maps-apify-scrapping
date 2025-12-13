@@ -8,6 +8,7 @@ from .airtable_utils import fetch_existing_leads, filter_airtable_fields, get_ai
 from .apollo import enrich_apollo
 from .apify_scraper import scrape_apify
 from .credits import get_apify_credits
+from .gemini_zones import generate_zones_with_gemini
 from .instantly import export_leads_to_instantly, find_or_create_instantly_campaign
 from .parsing import parse_address_components
 
@@ -60,8 +61,31 @@ def execute_with_credit_tracking(
         dashboard.update_status("Fetching existing leads for deduplication...", 10)
         exist_webs, exist_phones = fetch_existing_leads(table_leads)
 
+        # Optional: Gemini-based location splitting (10 zones). Fallback is single query on ANY error/invalid output.
+        split_enabled = bool(st.session_state.get("use_gemini_split", True))
+        zones = None
+        if split_enabled and secrets.get("gemini_key"):
+            dashboard.update_status("Generating 10 split zones with Gemini...", 18)
+            zones_res = generate_zones_with_gemini(
+                city_input,
+                api_key=secrets.get("gemini_key"),
+                debug=debug_mode,
+            )
+            zones = zones_res.zones if zones_res else None
+
+        per_zone_cap = max(1, int((max_leads + 10 - 1) / 10)) if zones else max_leads
+        dashboard.init_split_view(zones=zones or [], per_zone_cap=per_zone_cap, max_leads=max_leads, enabled=split_enabled)
+
         dashboard.update_status(f"Scraping '{industry} in {city_input}' via Apify...", 20)
-        raw_leads = scrape_apify(secrets["apify_token"], industry, city_input, max_leads)
+        raw_leads = scrape_apify(
+            secrets["apify_token"],
+            industry,
+            city_input,
+            max_leads,
+            zones=zones,
+            dashboard=dashboard,
+            debug=debug_mode,
+        )
         total_scraped = len(raw_leads)
 
         result_data["total_scraped"] = total_scraped
