@@ -53,6 +53,9 @@ class StatusDashboard:
         scraped_count: int,
         cumulative_unique: int,
         status: str,
+        enriched_count: int = 0,
+        instantly_count: int = 0,
+        synced_count: int = 0,
     ):
         """Upsert a row for the current zone and re-render."""
         row = {
@@ -60,6 +63,9 @@ class StatusDashboard:
             "zone": zone,
             "query": query,
             "scraped": int(scraped_count or 0),
+            "enriched": 0,
+            "instantly": 0,
+            "synced": 0,
             "cumulative_unique": int(cumulative_unique or 0),
             "status": status,
         }
@@ -67,6 +73,15 @@ class StatusDashboard:
         replaced = False
         for i, existing in enumerate(self._split_rows):
             if existing.get("#") == row["#"]:
+                # Preserve existing counts if not explicitly updated in this call,
+                # dependent on how the runner calls it. Actually, the runner should pass
+                # the latest state. But to be safe, let's assume we pass what we have.
+                # If the runner passes 0 for enriched, it might overwrite if we are not careful.
+                # Better approach: The runner tracks state and passes the full counts every time.
+                row["enriched"] = enriched_count if enriched_count > 0 else existing.get("enriched", 0)
+                row["instantly"] = instantly_count if instantly_count > 0 else existing.get("instantly", 0)
+                row["synced"] = synced_count if synced_count > 0 else existing.get("synced", 0)
+                
                 self._split_rows[i] = row
                 replaced = True
                 break

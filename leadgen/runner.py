@@ -27,6 +27,7 @@ def execute_with_credit_tracking(
 ):
     """
     Wrapper function that tracks credit usage before and after execution.
+    Batches the process (Scrape -> Enrich -> Instantly -> Airtable) per zone to ensure data is saved incrementally.
     Returns: (result_data, credit_used_apify, credit_used_apollo, credit_used_instantly)
     """
     dashboard.update_status("Snapshotting API Credits...", 5)
@@ -61,6 +62,7 @@ def execute_with_credit_tracking(
         dashboard.update_status("Fetching existing leads for deduplication...", 10)
         exist_webs, exist_phones = fetch_existing_leads(table_leads)
 
+        # Prepare zones for batch loop
         # Optional: Gemini-based location splitting (10 zones). Fallback is single query on ANY error/invalid output.
         split_enabled = bool(st.session_state.get("use_gemini_split", True))
         zones = None
@@ -72,209 +74,320 @@ def execute_with_credit_tracking(
                 debug=debug_mode,
             )
             zones = zones_res.zones if zones_res else None
+        
+        # If no zones (split disabled or failed), treat as 1 "zone" which is the full city
+        target_zones = zones if zones else [city_input]
+        is_split_run = bool(zones)
 
-        per_zone_cap = max(1, int((max_leads + 10 - 1) / 10)) if zones else max_leads
-        dashboard.init_split_view(zones=zones or [], per_zone_cap=per_zone_cap, max_leads=max_leads, enabled=split_enabled)
+        per_zone_cap = max(1, int((max_leads + len(target_zones) - 1) / len(target_zones))) if is_split_run else max_leads
+        # Cap per zone to avoid over-fetching if many zones
+        if is_split_run:
+             per_zone_cap = min(max_leads, max(per_zone_cap, min(75, max_leads)))
 
-        dashboard.update_status(f"Scraping '{industry} in {city_input}' via Apify...", 20)
-        raw_leads = scrape_apify(
-            secrets["apify_token"],
-            industry,
-            city_input,
-            max_leads,
-            zones=zones,
-            dashboard=dashboard,
-            debug=debug_mode,
-        )
-        total_scraped = len(raw_leads)
+        dashboard.init_split_view(zones=target_zones if is_split_run else [], per_zone_cap=per_zone_cap, max_leads=max_leads, enabled=split_enabled)
 
-        result_data["total_scraped"] = total_scraped
-        dashboard.stats["Total Scraped"] = total_scraped
-        dashboard.refresh_metrics()
-
-        if total_scraped == 0:
-            dashboard.update_status("No leads found from scraper.", 100)
-            return result_data, 0, 0, 0
-
-        dashboard.update_status(f"Processing {total_scraped} leads...", 30)
-
-        leads_to_enrich = []
-        processed_records = []
-
-        for item in raw_leads:
-            website = item.get("website")
-            title = item.get("title", "Unknown Company")
-            map_phone = item.get("phoneNumber") or item.get("phone") or item.get("internationalPhoneNumber")
-
-            clean_web = str(website).strip().lower() if website else None
-            clean_phone = "".join(filter(str.isdigit, str(map_phone))) if map_phone else None
-
-            if (clean_web and clean_web in exist_webs) or (clean_phone and clean_phone in exist_phones):
-                dashboard.update_metric("Skipped")
-                continue
-
-            parsed_city, parsed_state, parsed_postal_code = parse_address_components(item.get("address"), city_input)
-
-            record = {
-                "company_name": title,
-                "industry": industry,
-                "city": parsed_city,
-                "state": parsed_state,
-                "postal_code": parsed_postal_code,
-                "website": website,
-                "generic_phone": map_phone,
-                "rating": item.get("totalScore"),
-                "postal_address": item.get("address"),
-                "scrapping_tool": scrapping_tool_id,
-                "key_contact_name": None,
-                "key_contact_email": None,
-                "key_contact_position": None,
-            }
-
-            record = filter_airtable_fields(record, allowed_leads_fields)
-            processed_records.append(record)
-
-            if clean_web and enrich_emails:
-                apollo_domain = clean_web.split("?")[0].split("#")[0]
-                leads_to_enrich.append((len(processed_records) - 1, apollo_domain, title))
-
-            if clean_web:
-                exist_webs.add(clean_web)
-            if clean_phone:
-                exist_phones.add(clean_phone)
-
-        if leads_to_enrich:
-            total_enrich = len(leads_to_enrich)
-            dashboard.update_status(f"Enriching {total_enrich} leads in parallel...", 40)
-
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                future_to_idx = {
-                    executor.submit(enrich_apollo, secrets["apollo_key"], domain): (idx, title)
-                    for idx, domain, title in leads_to_enrich
-                }
-
-                completed_count = 0
-                for future in as_completed(future_to_idx):
-                    idx, title = future_to_idx[future]
-                    completed_count += 1
-
-                    prog = 40 + int((completed_count / total_enrich) * 45)
-                    dashboard.progress_bar.progress(prog)
-                    dashboard.status_container.markdown(f"**Enriched:** {title}")
-
-                    try:
-                        name, email, position = future.result()
-                        if name and email:
-                            result_data["apollo_calls_estimated"] += 1
-
-                        if name:
-                            set_if_allowed(processed_records[idx], "key_contact_name", name)
-                            set_if_allowed(processed_records[idx], "key_contact_email", email)
-                            set_if_allowed(processed_records[idx], "key_contact_position", position)
-                            dashboard.update_metric("Enriched")
-                            dashboard.update_metric("Success")
-                        else:
-                            dashboard.update_metric("Success")
-                    except Exception as exc:
-                        dashboard.log(f"Enrichment error for {title}: {exc}", level="error")
-                        dashboard.update_metric("Errors")
-        else:
-            dashboard.update_status("Skipping enrichment (no valid websites or disabled)...", 80)
-            for _ in processed_records:
-                dashboard.update_metric("Success")
-
-        # Instantly export
+        # Global trackers
+        total_scraped_global = 0
+        collected_unique_leads = [] # stores dicts
+        seen_keys_global = set() # dedupe across batches
+        
         instantly_key = secrets.get("instantly_key")
-        instantly_added_count = 0
-
+        
+        # Pre-fetch instanly campaign if needed
+        campaign_id = None
         if instantly_key and enrich_emails:
-            dashboard.update_status("Checking Instantly Campaign...", 82)
-            campaign_name = f"{industry} - Cold Outreach"
-            campaign_id = find_or_create_instantly_campaign(instantly_key, campaign_name, debug=debug_mode)
+             campaign_name = f"{industry} - Cold Outreach"
+             # We try once at start; if fails, we might try inside loop or just skip. 
+             # Better to try once to avoid spamming if API down.
+             dashboard.update_status("Checking Instantly Campaign...", 15)
+             campaign_id = find_or_create_instantly_campaign(instantly_key, campaign_name, debug=debug_mode)
+             if not campaign_id:
+                  dashboard.log(f"Could not find/create campaign '{campaign_name}'", level="error")
 
-            if campaign_id:
-                valid_leads = [r for r in processed_records if r.get("key_contact_email")]
-                if valid_leads:
-                    dashboard.update_status(f"Exporting {len(valid_leads)} leads to Instantly...", 84)
-                    created_count, created_leads, _, export_err = export_leads_to_instantly(
-                        instantly_key, campaign_id, valid_leads, debug=debug_mode
-                    )
-                    instantly_added_count = created_count
+        # BATCH LOOP
+        for i, zone in enumerate(target_zones):
+             if len(collected_unique_leads) >= max_leads:
+                  if is_split_run:
+                       dashboard.set_split_stop_reason(
+                            f"Stopped before zone '{zone}' because we reached the limit: **{len(collected_unique_leads)} / {max_leads}** unique leads."
+                       )
+                  break
+             
+             zone_label = zone if is_split_run else f"{industry} in {city_input}"
+             dashboard.update_status(f"Batch {i+1}/{len(target_zones)}: Scraping '{zone_label}'...", 20 + int((i/len(target_zones))*10))
+             
+             # INIT ROW
+             current_zone_stats = {
+                  "scraped": 0,
+                  "enriched": 0,
+                  "instantly": 0,
+                  "synced": 0
+             }
+             if is_split_run:
+                  dashboard.update_split_row(
+                       zone_index=i,
+                       zone=zone,
+                       query=f"{industry} in {zone}",
+                       scraped_count=0,
+                       cumulative_unique=len(collected_unique_leads),
+                       status="Running",
+                       enriched_count=0,
+                       instantly_count=0,
+                       synced_count=0
+                  )
 
-                    # Default all exported candidates to Pending; mark Success for created leads.
-                    # created_leads include an "index" field which refers to the index in the request leads array.
-                    for r in processed_records:
-                        if r.get("key_contact_email"):
-                            set_if_allowed(r, "instantly_statuts", "Pending")
-                            set_if_allowed(r, "instantly_campaign_id", campaign_id)
+             # 1. SCRAPE
+             # We use scrape_apify in "no split" mode (passing None for zones) effectively, 
+             # but here we want to re-use the function.
+             # Actually, scrape_apify with zones=None does full scrape.
+             # We want to scrape JUST THIS ZONE.
+             # The existing scrape_apify is a bit hybrid. 
+             # Let's call it with zones=[zone] if split, or zones=None if not split (but loop size is 1).
+             
+             # To be cleaner, we can just call the logic for one zone. 
+             # But 'scrape_apify' encapsulates client creation etc.
+             # If we pass zones=[zone], it will loop once.
+             batch_leads = scrape_apify(
+                  secrets["apify_token"],
+                  industry,
+                  city_input, # ignored if zones is set
+                  max_leads=per_zone_cap, # fetch enough for this batch
+                  zones=[zone] if is_split_run else None, 
+                  dashboard=None, # We handle dashboard updates here to granularly track batch steps
+                  debug=debug_mode
+             )
+             
+             # Deduplicate Batch vs Global
+             batch_unique = []
+             for item in batch_leads:
+                  # Use same key logic as apify_scraper internal, or duplicate here?
+                  # apify_scraper internal deduplication is per-run. 
+                  # We need check against global.
+                  # Re-implementing _lead_key here or import it? 
+                  # It is private in apify_scraper. Let's do a quick local check or just rely on existing fields.
+                  # The 'raw_leads' usage below did 'exist_webs' check.
+                  
+                  website = item.get("website")
+                  map_phone = item.get("phoneNumber") or item.get("phone") or item.get("internationalPhoneNumber")
+                  
+                  clean_web = str(website).strip().lower() if website else None
+                  clean_phone = "".join(filter(str.isdigit, str(map_phone))) if map_phone else None
 
-                    if export_err:
-                        result_data["error_msg"] += f" | {export_err}"
-                        dashboard.log(export_err, level="error")
-                    else:
-                        # Map created lead IDs back to Airtable rows
-                        for created in created_leads or []:
+                  if (clean_web and clean_web in exist_webs) or (clean_phone and clean_phone in exist_phones):
+                       # dashboard.update_metric("Skipped") # Optional to noisy
+                       continue
+                  
+                  if clean_web: exist_webs.add(clean_web)
+                  if clean_phone: exist_phones.add(clean_phone)
+                  
+                  batch_unique.append(item)
+                  if len(collected_unique_leads) + len(batch_unique) >= max_leads:
+                       break
+             
+             total_scraped_global += len(batch_leads)
+             current_zone_stats["scraped"] = len(batch_leads)
+             dashboard.stats["Total Scraped"] += len(batch_leads)
+             dashboard.refresh_metrics()
+             
+             if not batch_unique:
+                  if is_split_run:
+                       dashboard.update_split_row(
+                            zone_index=i,
+                            zone=zone,
+                            query=f"{industry} in {zone}",
+                            scraped_count=len(batch_leads),
+                            cumulative_unique=len(collected_unique_leads),
+                            status="Done (No new)",
+                            enriched_count=0,
+                            instantly_count=0,
+                            synced_count=0
+                       )
+                  continue
+
+             # 2. PROCESS & FILTER
+             dashboard.update_status(f"Batch {i+1}: Processing {len(batch_unique)} new leads...", 30)
+             
+             processed_batch = []
+             leads_to_enrich_indices = [] # list of (index_in_processed_batch, domain, title)
+             
+             for item in batch_unique:
+                  title = item.get("title", "Unknown Company")
+                  website = item.get("website")
+                  map_phone = item.get("phoneNumber") or item.get("phone") or item.get("internationalPhoneNumber")
+                  
+                  parsed_city, parsed_state, parsed_postal_code = parse_address_components(item.get("address"), city_input)
+                  
+                  clean_web = str(website).strip().lower() if website else None
+
+                  record = {
+                    "company_name": title,
+                    "industry": industry,
+                    "city": parsed_city,
+                    "state": parsed_state,
+                    "postal_code": parsed_postal_code,
+                    "website": website,
+                    "generic_phone": map_phone,
+                    "rating": item.get("totalScore"),
+                    "postal_address": item.get("address"),
+                    "scrapping_tool": scrapping_tool_id,
+                    "key_contact_name": None,
+                    "key_contact_email": None,
+                    "key_contact_position": None,
+                  }
+                  record = filter_airtable_fields(record, allowed_leads_fields)
+                  processed_batch.append(record)
+                  
+                  if clean_web and enrich_emails:
+                       apollo_domain = clean_web.split("?")[0].split("#")[0]
+                       leads_to_enrich_indices.append((len(processed_batch)-1, apollo_domain, title))
+             
+             # 3. ENRICH
+             if leads_to_enrich_indices:
+                  total_enrich = len(leads_to_enrich_indices)
+                  dashboard.update_status(f"Batch {i+1}: Enriching {total_enrich} leads...", 40)
+                  
+                  params = [(secrets["apollo_key"], domain) for _, domain, _ in leads_to_enrich_indices]
+                  
+                  with ThreadPoolExecutor(max_workers=5) as executor:
+                       future_to_idx = {
+                            executor.submit(enrich_apollo, secrets["apollo_key"], domain): (idx, title)
+                            for idx, domain, title in leads_to_enrich_indices
+                       }
+                       
+                       completed_count = 0
+                       for future in as_completed(future_to_idx):
                             try:
-                                idx = int(created.get("index"))
-                            except Exception:
-                                continue
-                            if 0 <= idx < len(valid_leads):
-                                r = valid_leads[idx]
-                                set_if_allowed(r, "instantly_statuts", "Success")
-                                set_if_allowed(r, "instantly_lead_id", created.get("id"))
-                else:
-                    dashboard.log("No leads with emails to export.")
-            else:
-                dashboard.log(f"Could not find/create campaign '{campaign_name}'", level="error")
-        elif instantly_key and not enrich_emails:
-            dashboard.log("Skipping Instantly export: Verification (Enrichment) disabled.", level="warning")
-        elif not instantly_key:
-            dashboard.log("Skipping Instantly export: No API Key.", level="warning")
+                                 p_idx, p_title = future_to_idx[future]
+                                 name, email, position = future.result()
+                                 completed_count += 1
+                                 
+                                 if name and email:
+                                      result_data["apollo_calls_estimated"] += 1
+                                      current_zone_stats["enriched"] += 1
+                                 
+                                 if name:
+                                      set_if_allowed(processed_batch[p_idx], "key_contact_name", name)
+                                      set_if_allowed(processed_batch[p_idx], "key_contact_email", email)
+                                      set_if_allowed(processed_batch[p_idx], "key_contact_position", position)
+                                      dashboard.update_metric("Enriched")
+                                      dashboard.update_metric("Success")
+                                 else:
+                                      dashboard.update_metric("Success") # Count as success even if no enrichment found, we found the lead
 
-        result_data["instantly_added"] = instantly_added_count
+                                 # Live update of table row during enrichment? 
+                                 # Can do, but might be too frequent. Let's do it every 5 items or at end.
+                                 if is_split_run and completed_count % 5 == 0:
+                                      dashboard.update_split_row(
+                                           zone_index=i, zone=zone, query=f"{industry} in {zone}",
+                                           scraped_count=current_zone_stats["scraped"],
+                                           cumulative_unique=len(collected_unique_leads),
+                                           status="Enriching...",
+                                           enriched_count=current_zone_stats["enriched"],
+                                           instantly_count=0, synced_count=0
+                                      )
 
-        # Airtable sync
-        new_records = processed_records
-        if new_records:
-            dashboard.update_status(f"Syncing {len(new_records)} records to Airtable...", 85)
-            try:
-                table_leads.batch_create(new_records, typecast=True)
-                dashboard.update_status("Sync Complete!", 90)
-            except Exception as e:
-                # One-shot recovery for common Airtable case: trying to write to computed/read-only fields.
-                err_str = str(e)
-                dropped_field = None
-                if "INVALID_VALUE_FOR_COLUMN" in err_str and 'Field "' in err_str:
-                    try:
-                        dropped_field = err_str.split('Field "', 1)[1].split('"', 1)[0]
-                    except Exception:
-                        dropped_field = None
+                            except Exception as exc:
+                                 dashboard.log(f"Enrichment error: {exc}", level="error")
+                                 dashboard.update_metric("Errors")
+             else:
+                  for _ in processed_batch:
+                       dashboard.update_metric("Success")
+             
+             # 4. INSTANTLY EXPORT
+             if campaign_id and enrich_emails:
+                  valid_leads_instantly = [r for r in processed_batch if r.get("key_contact_email")]
+                  if valid_leads_instantly:
+                       dashboard.update_status(f"Batch {i+1}: Exporting {len(valid_leads_instantly)} to Instantly...", 80)
+                       created_cnt, created_list, _, exp_err = export_leads_to_instantly(
+                            instantly_key, campaign_id, valid_leads_instantly, debug=debug_mode
+                       )
+                       result_data["instantly_added"] += created_cnt
+                       current_zone_stats["instantly"] = created_cnt
+                       
+                       # Update local records with status
+                       for r in processed_batch:
+                            if r.get("key_contact_email"):
+                                 set_if_allowed(r, "instantly_statuts", "Pending")
+                                 set_if_allowed(r, "instantly_campaign_id", campaign_id)
+                       
+                       if exp_err:
+                            result_data["error_msg"] += f" | Batch {i}: {exp_err}"
+                            dashboard.log(exp_err, level="error")
+                       else:
+                            # Map back IDs
+                            for created in created_list or []:
+                                 try:
+                                      c_idx = int(created.get("index"))
+                                      if 0 <= c_idx < len(valid_leads_instantly):
+                                           set_if_allowed(valid_leads_instantly[c_idx], "instantly_statuts", "Success")
+                                           set_if_allowed(valid_leads_instantly[c_idx], "instantly_lead_id", created.get("id"))
+                                 except: pass
 
-                if dropped_field:
-                    cleaned = []
-                    for r in new_records:
-                        if isinstance(r, dict) and dropped_field in r:
-                            r = dict(r)
-                            r.pop(dropped_field, None)
-                        cleaned.append(r)
-                    try:
-                        table_leads.batch_create(cleaned, typecast=True)
-                        dashboard.update_status(f"Sync Complete! (Dropped computed field: {dropped_field})", 90)
-                        new_records = cleaned
-                    except Exception as e2:
-                        msg = f"Airtable Sync Failed: {e2}"
-                        dashboard.log(msg, level="error")
-                        result_data["error_msg"] += f" | {msg}"
-                        st.error(msg)
-                else:
-                    msg = f"Airtable Sync Failed: {e}"
-                    dashboard.log(msg, level="error")
-                    result_data["error_msg"] += f" | {msg}"
-                    st.error(msg)
+             # 5. AIRTABLE SYNC (Intermediate Save)
+             dashboard.update_status(f"Batch {i+1}: Syncing {len(processed_batch)} to Airtable...", 90)
+             try:
+                  if processed_batch:
+                       table_leads.batch_create(processed_batch, typecast=True)
+                       current_zone_stats["synced"] = len(processed_batch)
+             except Exception as e:
+                  # Retry logic for computed fields
+                  err_str = str(e)
+                  dropped_field = None
+                  if "INVALID_VALUE_FOR_COLUMN" in err_str and 'Field "' in err_str:
+                       try:
+                            dropped_field = err_str.split('Field "', 1)[1].split('"', 1)[0]
+                       except: dropped_field = None
+                  
+                  if dropped_field:
+                       cleaned = []
+                       for r in processed_batch:
+                            if isinstance(r, dict) and dropped_field in r:
+                                 r = dict(r)
+                                 r.pop(dropped_field, None)
+                            cleaned.append(r)
+                       try:
+                            table_leads.batch_create(cleaned, typecast=True)
+                            current_zone_stats["synced"] = len(cleaned)
+                            processed_batch = cleaned # keep cleaned for history
+                       except Exception as e2:
+                            msg = f"Batch {i} Sync Failed: {e2}"
+                            dashboard.log(msg, level="error")
+                            result_data["error_msg"] += f" | {msg}"
+                  else:
+                       msg = f"Batch {i} Sync Failed: {e}"
+                       dashboard.log(msg, level="error")
+                       result_data["error_msg"] += f" | {msg}"
 
-        result_data["new_added"] = len(new_records)
-        result_data["new_records"] = new_records
-        result_data["status"] = "Success" if new_records or total_scraped > 0 else "Zero Results"
+             # Batch Complete
+             collected_unique_leads.extend(processed_batch)
+             result_data["new_records"].extend(processed_batch)
+             
+             if is_split_run:
+                  dashboard.update_split_row(
+                       zone_index=i,
+                       zone=zone,
+                       query=f"{industry} in {zone}",
+                       scraped_count=current_zone_stats["scraped"],
+                       cumulative_unique=len(collected_unique_leads),
+                       status="Done",
+                       enriched_count=current_zone_stats["enriched"],
+                       instantly_count=current_zone_stats["instantly"],
+                       synced_count=current_zone_stats["synced"]
+                  )
+        
+        # End Loop
+        result_data["total_scraped"] = total_scraped_global
+        result_data["new_added"] = len(collected_unique_leads)
+        
+        if is_split_run:
+             dashboard.set_split_stop_reason(
+                 f"Finished all zones. Collected **{len(collected_unique_leads)} / {max_leads}** total unique leads."
+             )
+        else:
+             dashboard.update_status("Execution Complete!", 100)
+
+        result_data["status"] = "Success" if collected_unique_leads or total_scraped_global > 0 else "Zero Results"
+
 
     except Exception as e:
         result_data["status"] = "Failed"
