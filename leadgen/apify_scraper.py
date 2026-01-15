@@ -26,7 +26,7 @@ def _lead_key(item: dict) -> str:
 
 def scrape_apify(
     token,
-    industry,
+    query,
     city,
     max_leads,
     *,
@@ -42,7 +42,7 @@ def scrape_apify(
 
     # No-split fallback: previous behavior
     if not zones:
-        search_term = f"{industry} in {city}"
+        search_term = f"{query} in {city}"
 
         run_input = {
             "searchStringsArray": [search_term],
@@ -68,7 +68,7 @@ def scrape_apify(
     seen_keys = set()
 
     for i, zone in enumerate(zones):
-        query = f"{industry} in {zone}"
+        search_term = f"{query} in {zone}"
         if dashboard:
             dashboard.update_split_row(
                 zone_index=i,
@@ -80,7 +80,7 @@ def scrape_apify(
             )
 
         run_input = {
-            "searchStringsArray": [query],
+            "searchStringsArray": [search_term],
             "maxCrawledPlacesPerSearch": per_zone_cap,
             "language": "en",
             "maxImages": 0,
@@ -96,13 +96,13 @@ def scrape_apify(
                 dashboard.update_split_row(
                     zone_index=i,
                     zone=zone,
-                    query=query,
+                    query=search_term,
                     scraped_count=0,
                     cumulative_unique=len(collected),
                     status=f"Error: {e}",
                 )
             if debug and dashboard:
-                dashboard.log(f"Apify split query failed for '{query}': {e}", level="error")
+                dashboard.log(f"Apify split query failed for '{search_term}': {e}", level="error")
             continue
 
         added_this_zone = 0
@@ -121,7 +121,7 @@ def scrape_apify(
             dashboard.update_split_row(
                 zone_index=i,
                 zone=zone,
-                query=query,
+                query=search_term,
                 scraped_count=len(items),
                 cumulative_unique=len(collected),
                 status="Done" if len(collected) < max_leads else "Stopped (limit reached)",

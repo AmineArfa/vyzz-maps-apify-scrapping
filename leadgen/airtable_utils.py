@@ -154,6 +154,7 @@ def log_transaction(
     credit_used_apollo=None,
     credit_used_instantly=None,
     instantly_added=None,
+    search_query=None,
 ):
     """Write log entry to Airtable with credit tracking."""
     try:
@@ -166,6 +167,9 @@ def log_transaction(
             "Status": status,
             "Error Message": str(error_msg),
         }
+
+        if search_query:
+            log_data["search_query"] = search_query
 
         if credit_used_apify is not None:
             log_data["credit_used_apify"] = float(credit_used_apify)

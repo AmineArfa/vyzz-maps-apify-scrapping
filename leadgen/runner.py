@@ -24,6 +24,7 @@ def execute_with_credit_tracking(
     *,
     leads_table_id: str,
     scrapping_tool_id: str,
+    search_query: str,
 ):
     """
     Wrapper function that tracks credit usage before and after execution.
@@ -113,7 +114,7 @@ def execute_with_credit_tracking(
                        )
                   break
              
-             zone_label = zone if is_split_run else f"{industry} in {city_input}"
+             zone_label = zone if is_split_run else f"{search_query} in {city_input}"
              dashboard.update_status(f"Batch {i+1}/{len(target_zones)}: Scraping '{zone_label}'...", 20 + int((i/len(target_zones))*10))
              
              # INIT ROW
@@ -127,7 +128,7 @@ def execute_with_credit_tracking(
                   dashboard.update_split_row(
                        zone_index=i,
                        zone=zone,
-                       query=f"{industry} in {zone}",
+                       query=f"{search_query} in {zone}",
                        scraped_count=0,
                        cumulative_unique=len(collected_unique_leads),
                        status="Running",
@@ -149,7 +150,7 @@ def execute_with_credit_tracking(
              # If we pass zones=[zone], it will loop once.
              batch_leads = scrape_apify(
                   secrets["apify_token"],
-                  industry,
+                  search_query,
                   city_input, # ignored if zones is set
                   max_leads=per_zone_cap, # fetch enough for this batch
                   zones=[zone] if is_split_run else None, 
@@ -194,7 +195,7 @@ def execute_with_credit_tracking(
                        dashboard.update_split_row(
                             zone_index=i,
                             zone=zone,
-                            query=f"{industry} in {zone}",
+                            query=f"{search_query} in {zone}",
                             scraped_count=len(batch_leads),
                             cumulative_unique=len(collected_unique_leads),
                             status="Done (No new)",
@@ -278,7 +279,7 @@ def execute_with_credit_tracking(
                                  # Can do, but might be too frequent. Let's do it every 5 items or at end.
                                  if is_split_run and completed_count % 5 == 0:
                                       dashboard.update_split_row(
-                                           zone_index=i, zone=zone, query=f"{industry} in {zone}",
+                                           zone_index=i, zone=zone, query=f"{search_query} in {zone}",
                                            scraped_count=current_zone_stats["scraped"],
                                            cumulative_unique=len(collected_unique_leads),
                                            status="Enriching...",

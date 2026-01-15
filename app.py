@@ -75,7 +75,27 @@ def main():
 
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
-        industry = st.selectbox("Industry", st.session_state["industry_options"] or ["Generic"])
+        # Default behavior: When industry changes, update the search query to match,
+        # unless user has manually typed something else (optional).
+        # Requirement: "default being the industry selected (switching when another industry selected)"
+        # This implies we should listen to industry change.
+
+        def on_industry_change():
+            st.session_state["search_query_input"] = st.session_state["industry_selector"]
+
+        industry = st.selectbox(
+            "Industry", 
+            st.session_state["industry_options"] or ["Generic"],
+            key="industry_selector",
+            on_change=on_industry_change
+        )
+        
+        # Initialize search query if not present
+        if "search_query_input" not in st.session_state:
+            st.session_state["search_query_input"] = industry
+
+        search_query = st.text_input("Search Query", key="search_query_input")
+
     with col2:
         city_input = st.text_input("City", placeholder="e.g. New York")
     with col3:
@@ -100,6 +120,7 @@ def main():
             status_dashboard,
             leads_table_id=AIRTABLE_LEADS_TABLE,
             scrapping_tool_id=SCRAPPING_TOOL_ID,
+            search_query=search_query,
         )
 
         status_dashboard.update_status("Execution Complete!", 100)
@@ -117,6 +138,7 @@ def main():
             credit_used_apollo=credit_used_apollo,
             credit_used_instantly=credit_used_instantly,
             instantly_added=result_data.get("instantly_added"),
+            search_query=search_query,
         )
 
         if result_data["status"] in ("Success", "Zero Results"):
