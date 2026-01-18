@@ -141,6 +141,44 @@ def fetch_existing_leads(table_leads):
         return set(), set()
 
 
+def fetch_all_leads(table_leads):
+    """Fetch all records from Airtable to populate the editor."""
+    try:
+        # Fetching all records. Warning: this can be slow for large tables.
+        records = table_leads.all()
+        # Transform into a list of dicts with 'id' included
+        data = []
+        for r in records:
+            row = r.get("fields", {})
+            row["id"] = r.get("id")
+            row["createdTime"] = r.get("createdTime")
+            # Fetch explicitly requested sync fields if they exist in 'fields' (user created columns)
+            # If they are missing, row.get() returns None, which is fine.
+            # Explicitly ensuring they are in the dict for DataFrame consistency if needed, 
+            # though pandas handles missing keys by creating NaN columns usually.
+            data.append(row)
+        return data
+    except Exception as e:
+        st.error(f"Error fetching all leads: {e}")
+        return []
+
+
+def batch_update_leads(table_leads, updates):
+    """
+    Batch update records in Airtable.
+    updates: list of dicts, each must have 'id' and 'fields' dict.
+             e.g. [{'id': 'rec...', 'fields': {'col': 'val'}}]
+    """
+    try:
+        # pyairtable's batch_update takes a list of dicts: {'id': '...', 'fields': {...}}
+        # Enable typecast to allow fuzzy matching (e.g. string numbers, new select options if allowed)
+        table_leads.batch_update(updates, typecast=True)
+        return True
+    except Exception as e:
+        st.error(f"Error updating leads: {e}")
+        return False
+
+
 def log_transaction(
     table_log,
     industry,

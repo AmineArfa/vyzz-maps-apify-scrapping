@@ -121,7 +121,11 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
 
     formatted_leads = []
     for lead in leads:
-        name_parts = (lead.get("key_contact_name") or "").split(" ")
+        raw_name = lead.get("key_contact_name")
+        if not isinstance(raw_name, str):
+            raw_name = ""
+        
+        name_parts = raw_name.split(" ")
         first_name = name_parts[0] if name_parts else ""
         last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
 
@@ -134,8 +138,15 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             "City": lead.get("city"),
             "state": lead.get("state"),
         }
-        # Drop empty values to keep payload clean
-        custom_variables = {k: v for k, v in custom_variables.items() if v not in (None, "", [])}
+        
+        # Drop empty values to keep payload clean. Also drop NaNs (float) to avoid JSON errors or "nan" strings.
+        # NaN != NaN is the standard python check for nan float.
+        def is_valid(v):
+            if v in (None, "", []): return False
+            if isinstance(v, float) and v != v: return False
+            return True
+
+        custom_variables = {k: v for k, v in custom_variables.items() if is_valid(v)}
 
         formatted_leads.append(
             {
@@ -198,3 +209,71 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
         return 0, [], None, err
 
 
+def is_valid_uuid(val):
+    """Simple check if string looks like a UUID (Instantly requirement)."""
+    if not isinstance(val, str): return False
+    # Typical UUID: 8-4-4-4-12 chars
+    parts = val.split("-")
+    return len(parts) == 5 and len(val) == 36
+
+
+def update_lead_in_instantly(api_key, lead_id, lead_data, debug=False):
+    """
+    Update an existing lead in Instantly using PATCH.
+    lead_data should be formatted correctly for the API.
+    """
+    if not api_key or not lead_id or not lead_data:
+        return False, "Missing api_key, lead_id, or lead_data"
+
+    if not is_valid_uuid(lead_id):
+        return False, f"Invalid Lead ID format (not a UUID): {lead_id}"
+
+    url = f"{BASE_URL}/api/v2/leads/{lead_id}"
+    headers = _headers(api_key)
+
+    try:
+        resp = requests.patch(url, headers=headers, json=lead_data, timeout=20)
+        if resp.status_code == 200:
+            if debug:
+                st.write(f"✅ Updated lead {lead_id} in Instantly.")
+            return True, None
+        err = f"Instantly lead update failed: {resp.status_code} - {resp.text}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
+    except Exception as e:
+        err = f"Instantly lead update exception: {e}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
+
+
+def delete_lead_from_instantly(api_key, lead_id, debug=False):
+    """
+    Delete a lead from Instantly.
+    """
+    if not api_key or not lead_id:
+        return False, "Missing api_key or lead_id"
+
+    if not is_valid_uuid(lead_id):
+        return False, f"Invalid Lead ID format (not a UUID): {lead_id}"
+
+    url = f"{BASE_URL}/api/v2/leads/{lead_id}"
+    # Remove Content-Type if body is empty to avoid FST_ERR_CTP_EMPTY_JSON_BODY
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        resp = requests.delete(url, headers=headers, timeout=20)
+        if resp.status_code == 200 or resp.status_code == 204:
+            if debug:
+                st.write(f"✅ Deleted lead {lead_id} from Instantly.")
+            return True, None
+        err = f"Instantly lead delete failed: {resp.status_code} - {resp.text}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
+    except Exception as e:
+        err = f"Instantly lead delete exception: {e}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err

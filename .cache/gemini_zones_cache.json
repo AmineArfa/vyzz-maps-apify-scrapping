@@ -13,5 +13,20 @@
       "Pacific Heights, San Francisco, CA, USA",
       "Tenderloin, San Francisco, CA, USA"
     ]
+  },
+  "models/gemini-flash-lite-latest::baltimore": {
+    "ts": 1768742453.6365237,
+    "zones": [
+      "Federal Hill, Baltimore, MD, USA",
+      "Inner Harbor, Baltimore, MD, USA",
+      "Fells Point, Baltimore, MD, USA",
+      "Canton, Baltimore, MD, USA",
+      "Mount Vernon, Baltimore, MD, USA",
+      "Highlandtown, Baltimore, MD, USA",
+      "Pigtown, Baltimore, MD, USA",
+      "South Baltimore, Baltimore, MD, USA",
+      "Charles Village, Baltimore, MD, USA",
+      "West Baltimore, Baltimore, MD, USA"
+    ]
   }
 }
