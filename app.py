@@ -400,7 +400,14 @@ def main():
                      
                      status.update(label="✅ Sync Complete!", state="complete", expanded=False)
                      
-                     # 4. Refresh
+                     # 4. Save results to session state for persistent logging
+                     st.session_state["last_sync_results"] = {
+                         "timestamp": pd.Timestamp.now().strftime("%H:%M:%S"),
+                         "count": success_count,
+                         "details": results # Full results list from the parallel execution
+                     }
+                     
+                     # 5. Refresh
                      del st.session_state["lead_df"]
                      st.rerun()
 
@@ -427,6 +434,23 @@ def main():
             )
         else:
             st.success("🎉 Everything is up to date! Modify records in Airtable to see them here.")
+
+        # --- PERSISTENT LOGS AT BOTTOM ---
+        if "last_sync_results" in st.session_state:
+            res = st.session_state["last_sync_results"]
+            st.divider()
+            with st.expander(f"📋 Last Sync Log ({res['timestamp']}) - {res['count']} Successes", expanded=True):
+                for item in res["details"]:
+                    if item.get("status") == "Success":
+                        op = item.get("op", "Sync")
+                        st.write(f"✅ **{item['id']}**: {op} successful")
+                    else:
+                        st.error(f"❌ **{item['id']}**: {item.get('error') or item.get('status')}")
+                
+                if st.button("🧹 Clear Logs"):
+                    del st.session_state["last_sync_results"]
+                    st.rerun()
+
 
 
 if __name__ == "__main__":
