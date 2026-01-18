@@ -390,12 +390,12 @@ def main():
                      # 3. Process Results and Update Airtable
                      success_count = 0
                      for res in results:
-                         fields = {"last_synced_at": timestamp_now}
-                         
+                         # IMPORTANT: Only update last_synced_at on SUCCESS so failures stay "Pending"
                          if res.get("status") == "Success":
                              success_count += 1
-                             op = res.get("op")
+                             fields = {"last_synced_at": timestamp_now}
                              
+                             op = res.get("op")
                              if op in ("Create", "Update"):
                                  fields["instantly_statuts"] = "Success"
                              elif op == "Delete":
@@ -403,14 +403,19 @@ def main():
                              else: # Skip
                                  fields["instantly_statuts"] = None 
                              
-                             # Manage IDs
+                             # Persist the (new) Instantly IDs
                              fields["instantly_lead_id"] = res.get("new_instantly_id")
                              fields["instantly_campaign_id"] = res.get("campaign_id")
+                             
+                             airtable_updates.append({"id": res["id"], "fields": fields})
                          else:
-                             fields["instantly_statuts"] = "Failed"
+                             # On Failure: We mark as Failed in Airtable but do NOT update last_synced_at
+                             # This keeps it in the "Pending" list for user to fix/retry.
+                             airtable_updates.append({
+                                 "id": res["id"], 
+                                 "fields": {"instantly_statuts": "Failed"}
+                             })
                              status.write(f"⚠️ Row {res['id']}: {res.get('error')}")
-                         
-                         airtable_updates.append({"id": res["id"], "fields": fields})
                      
                      # 4. Final Airtable Batch Update
                      if airtable_updates:
@@ -425,6 +430,7 @@ def main():
                          status.write("ℹ️ No updates to push to Airtable.")
                      
                      status.update(label="✅ Sync Complete!", state="complete", expanded=False)
+
                      
                      # 4. Save results to session state for persistent logging
                      st.session_state["last_sync_results"] = {
