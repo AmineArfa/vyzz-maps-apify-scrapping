@@ -209,6 +209,28 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
         return 0, [], None, err
 
 
+def get_lead_from_instantly(api_key, lead_id, debug=False):
+    """
+    Retrieve lead details from Instantly.
+    """
+    if not api_key or not lead_id:
+        return None, "Missing api_key or lead_id"
+
+    if not is_valid_uuid(lead_id):
+        return None, f"Invalid Lead ID format: {lead_id}"
+
+    url = f"{BASE_URL}/api/v2/leads/{lead_id}"
+    headers = _headers(api_key)
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            return resp.json(), None
+        return None, f"Instantly get lead failed: {resp.status_code} - {resp.text}"
+    except Exception as e:
+        return None, f"Instantly get lead exception: {e}"
+
+
 def is_valid_uuid(val):
     """Simple check if string looks like a UUID (Instantly requirement)."""
     if not isinstance(val, str): return False
