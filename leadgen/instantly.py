@@ -16,6 +16,11 @@ def _headers(api_key: str):
 _campaign_vars_lock = threading.Lock()
 _campaign_vars_registered: set[str] = set()
 
+# Module-level campaign management to prevent duplicates across all threads/calls
+_campaign_cache_lock = threading.Lock()
+_campaign_cache: dict[str, str] = {}  # name -> id
+_campaign_cache_loaded = False
+
 
 def _request_with_retry(
     method: str,
@@ -161,50 +166,108 @@ def _list_all_campaigns(api_key, debug=False):
     return all_campaigns
 
 
+def _load_campaign_cache(api_key, debug=False):
+    """
+    Load all existing campaigns into the module-level cache.
+    Should be called once at the start of a sync session.
+    Thread-safe.
+    """
+    global _campaign_cache_loaded
+    
+    with _campaign_cache_lock:
+        if _campaign_cache_loaded:
+            return True  # Already loaded
+        
+        campaigns = _list_all_campaigns(api_key, debug=debug)
+        if campaigns is None:
+            return False  # Failed to load
+        
+        for c in campaigns:
+            name = c.get("name")
+            cid = c.get("id")
+            if name and cid:
+                _campaign_cache[name] = cid
+        
+        _campaign_cache_loaded = True
+        if debug:
+            st.write(f"📋 Loaded {len(_campaign_cache)} existing campaigns into cache")
+        return True
+
+
+def reset_campaign_cache():
+    """Reset the campaign cache. Call this at the start of a new sync session."""
+    global _campaign_cache_loaded
+    with _campaign_cache_lock:
+        _campaign_cache.clear()
+        _campaign_cache_loaded = False
+
+
 def find_or_create_instantly_campaign(api_key, campaign_name, debug=False):
     """
     Finds a campaign by name or creates it. Returns: campaign_id or None.
     
-    IMPORTANT: This function will return None (fail) rather than risk creating
-    a duplicate campaign if it can't verify whether the campaign already exists.
+    Uses a module-level lock and cache to GUARANTEE no duplicate campaigns
+    are created, even when called from multiple threads simultaneously.
     """
+    global _campaign_cache_loaded
+    
     if not api_key:
         return None
 
     headers = _headers(api_key)
 
-    # Step 1: List ALL campaigns (with pagination) to find existing one
-    campaigns = _list_all_campaigns(api_key, debug=debug)
-    
-    if campaigns is None:
-        # Could not list campaigns - DO NOT create to avoid duplicates
-        if debug:
-            st.write(f"❌ Cannot verify if campaign '{campaign_name}' exists - aborting to prevent duplicates")
-        return None
-    
-    # Search for existing campaign by name
-    for c in campaigns:
-        if c.get("name") == campaign_name:
+    # Use module-level lock to ensure only one thread can create campaigns at a time
+    with _campaign_cache_lock:
+        # Step 1: Check in-memory cache first (instant, no API call)
+        if campaign_name in _campaign_cache:
             if debug:
-                st.write(f"✅ Found existing campaign: {campaign_name}")
-            return c.get("id")
-    
-    # Step 2: Campaign not found - create it
-    try:
-        url = f"{BASE_URL}/api/v2/campaigns"
-        data = {"name": campaign_name, "campaign_schedule": _default_campaign_schedule()}
-        resp = _request_with_retry("POST", url, headers=headers, json_payload=data, timeout=30)
-        if resp.status_code == 200:
-            new_c = resp.json()
-            c_id = new_c.get("id") or new_c.get("data", {}).get("id")
+                st.write(f"✅ Found campaign in cache: {campaign_name}")
+            return _campaign_cache[campaign_name]
+        
+        # Step 2: If cache not loaded yet, load it now
+        if not _campaign_cache_loaded:
+            campaigns = _list_all_campaigns(api_key, debug=debug)
+            if campaigns is None:
+                if debug:
+                    st.write(f"❌ Cannot verify if campaign '{campaign_name}' exists - aborting to prevent duplicates")
+                return None
+            
+            for c in campaigns:
+                name = c.get("name")
+                cid = c.get("id")
+                if name and cid:
+                    _campaign_cache[name] = cid
+            
+            _campaign_cache_loaded = True
             if debug:
-                st.write(f"✅ Created new campaign: {campaign_name} ({c_id})")
-            return c_id
-        if debug:
-            st.write(f"❌ Campaign create failed: {resp.status_code} - {resp.text}")
-    except Exception as e:
-        if debug:
-            st.write(f"⚠️ Failed to create campaign: {e}")
+                st.write(f"📋 Loaded {len(_campaign_cache)} existing campaigns into cache")
+            
+            # Check again after loading
+            if campaign_name in _campaign_cache:
+                if debug:
+                    st.write(f"✅ Found campaign after loading cache: {campaign_name}")
+                return _campaign_cache[campaign_name]
+        
+        # Step 3: Campaign definitely doesn't exist - create it
+        # We're still inside the lock, so no other thread can create it simultaneously
+        try:
+            url = f"{BASE_URL}/api/v2/campaigns"
+            data = {"name": campaign_name, "campaign_schedule": _default_campaign_schedule()}
+            resp = _request_with_retry("POST", url, headers=headers, json_payload=data, timeout=30)
+            if resp.status_code == 200:
+                new_c = resp.json()
+                c_id = new_c.get("id") or new_c.get("data", {}).get("id")
+                if c_id:
+                    # Immediately add to cache BEFORE releasing lock
+                    _campaign_cache[campaign_name] = c_id
+                    if debug:
+                        st.write(f"✅ Created new campaign: {campaign_name} ({c_id})")
+                    return c_id
+            if debug:
+                st.write(f"❌ Campaign create failed: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            if debug:
+                st.write(f"⚠️ Failed to create campaign: {e}")
 
     return None
 

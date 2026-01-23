@@ -15,6 +15,7 @@ from leadgen.runner import execute_with_credit_tracking
 from leadgen.instantly import (
     export_leads_to_instantly,
     find_or_create_instantly_campaign,
+    reset_campaign_cache,
     update_lead_in_instantly,
     delete_lead_from_instantly,
     is_valid_uuid,
@@ -248,12 +249,12 @@ def main():
                      timestamp_now = pd.Timestamp.now(tz="UTC").isoformat()
                      
                      from concurrent.futures import ThreadPoolExecutor, as_completed
-                     import threading
                      from collections import Counter, defaultdict
                      
-                     # Cache campaigns by name so large syncs don't hammer the campaigns endpoint.
-                     campaign_cache: dict[str, str | None] = {}
-                     campaign_lock = threading.Lock()
+                     # Reset campaign cache at start of sync to ensure fresh view.
+                     # The module-level lock in instantly.py prevents duplicate creation.
+                     reset_campaign_cache()
+                     status.write("📋 Loading existing campaigns...")
                      
                      def _classify_error(err: str | None) -> str:
                          msg = str(err or "").lower()
@@ -286,14 +287,9 @@ def main():
                          if isinstance(industry, list): 
                              industry = industry[0]
                          
-                         # Campaign ID - use lock to prevent race condition creating duplicates
+                         # Campaign ID - module-level lock in instantly.py prevents duplicates
                          camp_name = f"{industry} - Cold Outreach"
-                         with campaign_lock:
-                             c_id = campaign_cache.get(camp_name)
-                             if not c_id:
-                                 # API call inside lock so only one thread can create a campaign at a time
-                                 c_id = find_or_create_instantly_campaign(secrets["instantly_key"], camp_name, debug=debug_mode)
-                                 campaign_cache[camp_name] = c_id
+                         c_id = find_or_create_instantly_campaign(secrets["instantly_key"], camp_name, debug=debug_mode)
                          if not c_id:
                              return {
                                  "id": lead_id_airtable,
