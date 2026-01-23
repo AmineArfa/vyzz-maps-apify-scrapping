@@ -20,6 +20,7 @@ from leadgen.instantly import (
     is_valid_uuid,
     get_lead_from_instantly,
 )
+from leadgen.json_sanitize import sanitize_for_json
 
 
 # --- CONSTANTS & CONFIGURATION ---
@@ -247,34 +248,58 @@ def main():
                      timestamp_now = pd.Timestamp.now(tz="UTC").isoformat()
                      
                      from concurrent.futures import ThreadPoolExecutor, as_completed
+                     import threading
+                     from collections import Counter, defaultdict
+                     
+                     # Cache campaigns by name so large syncs don't hammer the campaigns endpoint.
+                     campaign_cache: dict[str, str | None] = {}
+                     campaign_lock = threading.Lock()
+                     
+                     def _classify_error(err: str | None) -> str:
+                         msg = str(err or "").lower()
+                         if "out of range float values are not json compliant" in msg or " nan" in msg:
+                             return "nan_json"
+                         if "rate limit exceeded" in msg or "statuscode\":429" in msg or " 429" in msg:
+                             return "rate_limited"
+                         if "missing api_key, campaign_id, or leads" in msg or "missing api_key/campaign_id" in msg:
+                             return "missing_config"
+                         if "invalid lead id" in msg or "invalid lead id format" in msg:
+                             return "invalid_id"
+                         if "not found" in msg or "404" in msg:
+                             return "not_found"
+                         return "other"
                      
                      def process_single_lead(lead):
-                         lead_id_airtable = lead.get("id")
-                         lead_id_instantly = lead.get("instantly_lead_id")
-                         email_avail = lead.get("email_available")
-                         has_email_mark = str(email_avail) == "1" or email_avail is True
-                         email = lead.get("key_contact_email")
+                         clean_data = sanitize_for_json(lead or {})
                          
-                         industry = lead.get("industry")
+                         lead_id_airtable = clean_data.get("id")
+                         lead_id_instantly = clean_data.get("instantly_lead_id")
+                         email_avail = clean_data.get("email_available")
+                         has_email_mark = str(email_avail) == "1" or email_avail is True
+                         email = clean_data.get("key_contact_email")
+                         if not isinstance(email, str) or not email.strip():
+                             clean_data["key_contact_email"] = None
+                         
+                         industry = clean_data.get("industry")
                          if not industry:
                              industry = "Generic"
                          if isinstance(industry, list): 
                              industry = industry[0]
                          
-                         # Data cleaning for Instantly
-                         clean_data = {}
-                         for k, v in lead.items():
-                             if isinstance(v, float) and v != v: clean_data[k] = "[undefined]"
-                             elif v in (None, ""): clean_data[k] = "[undefined]"
-                             elif isinstance(v, pd.Timestamp): clean_data[k] = v.isoformat()
-                             else: clean_data[k] = v
-                         
-                         if clean_data.get("key_contact_email") == "[undefined]":
-                             clean_data["key_contact_email"] = None
-                             
                          # Campaign ID
                          camp_name = f"{industry} - Cold Outreach"
-                         c_id = find_or_create_instantly_campaign(secrets["instantly_key"], camp_name)
+                         with campaign_lock:
+                             c_id = campaign_cache.get(camp_name)
+                         if not c_id:
+                             c_id = find_or_create_instantly_campaign(secrets["instantly_key"], camp_name, debug=debug_mode)
+                             with campaign_lock:
+                                 campaign_cache[camp_name] = c_id
+                         if not c_id:
+                             return {
+                                 "id": lead_id_airtable,
+                                 "status": "Failed",
+                                 "error": f"Create Failed: No campaign available for '{camp_name}' (check Instantly API key / rate limit / permissions)",
+                             }
                          
                          # Result tracker
                          new_instantly_id = lead_id_instantly
@@ -302,7 +327,7 @@ def main():
                                      delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
                                      
                                      cnt, created, _, create_err = export_leads_to_instantly(
-                                         secrets["instantly_key"], c_id, [lead]
+                                         secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
                                      )
                                      if cnt > 0 and created:
                                          new_instantly_id = created[0].get("id")
@@ -313,8 +338,17 @@ def main():
                                      operation = "Update"
                                      raw_name = clean_data.get("key_contact_name", "")
                                      name_parts = str(raw_name).split(" ")
-                                     first_name = name_parts[0] if name_parts else "[undefined]"
-                                     last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else "[undefined]"
+                                     first_name = name_parts[0] if name_parts else ""
+                                     last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+                                     
+                                     custom_vars = {
+                                         "postalCode": clean_data.get("postal_code"),
+                                         "jobTitle": clean_data.get("key_contact_position"),
+                                         "address": clean_data.get("postal_address"),
+                                         "City": clean_data.get("city"),
+                                         "state": clean_data.get("state"),
+                                     }
+                                     custom_vars = {k: v for k, v in custom_vars.items() if v not in (None, "", [], {})}
                                      
                                      patch_payload = {
                                          "email": clean_data.get("key_contact_email"),
@@ -323,21 +357,18 @@ def main():
                                          "company_name": clean_data.get("company_name"),
                                          "website": clean_data.get("website"),
                                          "phone": clean_data.get("generic_phone"),
-                                         "custom_variables": {
-                                             "postalCode": clean_data.get("postal_code"),
-                                             "jobTitle": clean_data.get("key_contact_position"),
-                                             "address": clean_data.get("postal_address"),
-                                             "City": clean_data.get("city"),
-                                             "state": clean_data.get("state")
-                                         }
+                                         "custom_variables": custom_vars or None,
                                      }
-                                     success, err = update_lead_in_instantly(secrets["instantly_key"], lead_id_instantly, patch_payload)
+                                     patch_payload = sanitize_for_json(patch_payload)
+                                     success, err = update_lead_in_instantly(
+                                         secrets["instantly_key"], lead_id_instantly, patch_payload, debug=debug_mode
+                                     )
                                      if not success:
                                          # Fallback (repeat check just in case it 404'd between GET and PATCH)
                                          if "404" in str(err) or "not found" in str(err).lower():
                                              operation = "Create"
                                              cnt, created, _, create_err = export_leads_to_instantly(
-                                                 secrets["instantly_key"], c_id, [lead]
+                                                 secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
                                              )
                                              if cnt > 0 and created:
                                                  new_instantly_id = created[0].get("id")
@@ -348,7 +379,7 @@ def main():
                              else:
                                  # DELETE
                                  operation = "Delete"
-                                 success, err = delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
+                                 success, err = delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly, debug=debug_mode)
                                  new_instantly_id = None # Clear it
                                  if not success:
                                      if "not found" in str(err).lower():
@@ -361,7 +392,7 @@ def main():
                                  # POST
                                  operation = "Create"
                                  cnt, created, _, err = export_leads_to_instantly(
-                                     secrets["instantly_key"], c_id, [lead]
+                                     secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
                                  )
                                  if cnt > 0 and created:
                                      new_instantly_id = created[0].get("id")
@@ -389,6 +420,9 @@ def main():
                      
                      # 3. Process Results and Update Airtable
                      success_count = 0
+                     failure_rows: list[dict] = []
+                     failure_counts: Counter[str] = Counter()
+                     failure_samples: dict[str, list[str]] = defaultdict(list)
                      for res in results:
                          # IMPORTANT: Only update last_synced_at on SUCCESS so failures stay "Pending"
                          if res.get("status") == "Success":
@@ -415,7 +449,20 @@ def main():
                                  "id": res["id"], 
                                  "fields": {"instantly_statuts": "Failed"}
                              })
-                             status.write(f"⚠️ Row {res['id']}: {res.get('error')}")
+                             err = res.get("error")
+                             cat = _classify_error(err)
+                             failure_counts[cat] += 1
+                             if len(failure_samples[cat]) < 10:
+                                 failure_samples[cat].append(str(res["id"]))
+                             failure_rows.append(res)
+                             status.write(f"⚠️ Row {res['id']}: {err}")
+                     
+                     if failure_counts:
+                         status.write("—")
+                         status.write("🧪 Failure summary (by category):")
+                         for cat, cnt in failure_counts.most_common():
+                             sample = ", ".join(failure_samples.get(cat, [])[:5])
+                             status.write(f"- {cat}: {cnt} (sample: {sample})")
                      
                      # 4. Final Airtable Batch Update
                      if airtable_updates:
@@ -436,6 +483,9 @@ def main():
                      st.session_state["last_sync_results"] = {
                          "timestamp": pd.Timestamp.now().strftime("%H:%M:%S"),
                          "count": success_count,
+                         "failures": len(failure_rows),
+                         "failure_counts": dict(failure_counts),
+                         "failure_samples": dict(failure_samples),
                          "details": results # Full results list from the parallel execution
                      }
                      
@@ -471,7 +521,22 @@ def main():
         if "last_sync_results" in st.session_state:
             res = st.session_state["last_sync_results"]
             st.divider()
-            with st.expander(f"📋 Last Sync Log ({res['timestamp']}) - {res['count']} Successes", expanded=True):
+            failures = res.get("failures", 0)
+            with st.expander(
+                f"📋 Last Sync Log ({res['timestamp']}) - {res['count']} Successes / {failures} Failures",
+                expanded=True,
+            ):
+                fc = res.get("failure_counts") or {}
+                if fc:
+                    st.write("**Failure breakdown**")
+                    for k, v in sorted(fc.items(), key=lambda kv: kv[1], reverse=True):
+                        samples = ", ".join((res.get("failure_samples") or {}).get(k, [])[:5])
+                        st.write(f"- **{k}**: {v} (sample rows: {samples})")
+                    st.write(
+                        "**Notes**: `nan_json` means a NaN/Infinity sneaked into a payload; "
+                        "`rate_limited` is Instantly 429; `missing_config` usually means missing Instantly key or campaign creation failed."
+                    )
+                    st.divider()
                 for item in res["details"]:
                     if item.get("status") == "Success":
                         op = item.get("op", "Sync")

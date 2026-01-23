@@ -1,5 +1,10 @@
+import time
+import threading
+
 import requests
 import streamlit as st
+
+from .json_sanitize import sanitize_for_json
 
 
 BASE_URL = "https://api.instantly.ai"
@@ -7,6 +12,62 @@ BASE_URL = "https://api.instantly.ai"
 
 def _headers(api_key: str):
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+_campaign_vars_lock = threading.Lock()
+_campaign_vars_registered: set[str] = set()
+
+
+def _request_with_retry(
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    params: dict | None = None,
+    json_payload=None,
+    timeout: int = 30,
+    retries: int = 4,
+    backoff_s: float = 1.0,
+):
+    """
+    Thin retry wrapper for Instantly requests.
+    Retries on 429 and transient 5xx / network errors.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=json_payload,
+                timeout=timeout,
+            )
+
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait_s = float(retry_after) if retry_after else backoff_s * (2**attempt)
+                except Exception:
+                    wait_s = backoff_s * (2**attempt)
+                time.sleep(min(wait_s, 30))
+                continue
+
+            if 500 <= resp.status_code < 600 and attempt < retries:
+                time.sleep(min(backoff_s * (2**attempt), 10))
+                continue
+
+            return resp
+        except Exception as e:
+            last_exc = e
+            if attempt >= retries:
+                raise
+            time.sleep(min(backoff_s * (2**attempt), 10))
+
+    if last_exc:
+        raise last_exc
+
+    raise RuntimeError("request retry loop ended unexpectedly")
 
 
 def _default_campaign_schedule(timezone: str = "America/Chicago"):
@@ -40,7 +101,7 @@ def ensure_campaign_variables(api_key: str, campaign_id: str, variables: list[st
     payload = {"variables": variables}
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        resp = _request_with_retry("POST", url, headers=headers, json_payload=payload, timeout=20)
         if resp.status_code == 200:
             if debug:
                 st.write(f"✅ Registered campaign variables ({len(variables)})")
@@ -66,7 +127,7 @@ def find_or_create_instantly_campaign(api_key, campaign_name, debug=False):
     try:
         # Instantly v2: GET /api/v2/campaigns
         url = f"{BASE_URL}/api/v2/campaigns"
-        resp = requests.get(url, headers=headers, params={"limit": 100}, timeout=20)
+        resp = _request_with_retry("GET", url, headers=headers, params={"limit": 100}, timeout=20)
         if resp.status_code == 200:
             payload = resp.json()
             campaigns = payload.get("items", payload if isinstance(payload, list) else [])
@@ -83,7 +144,7 @@ def find_or_create_instantly_campaign(api_key, campaign_name, debug=False):
         # Instantly v2: POST /api/v2/campaigns requires name + campaign_schedule
         url = f"{BASE_URL}/api/v2/campaigns"
         data = {"name": campaign_name, "campaign_schedule": _default_campaign_schedule()}
-        resp = requests.post(url, headers=headers, json=data, timeout=30)
+        resp = _request_with_retry("POST", url, headers=headers, json_payload=data, timeout=30)
         if resp.status_code == 200:
             new_c = resp.json()
             c_id = new_c.get("id") or new_c.get("data", {}).get("id")
@@ -112,15 +173,22 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
     headers = _headers(api_key)
 
     # Ensure campaign variables are known ahead of import (non-blocking if it fails).
-    ensure_campaign_variables(
-        api_key,
-        campaign_id,
-        variables=["postalCode", "jobTitle", "address", "City", "state"],
-        debug=debug,
-    )
+    # Cache per campaign to avoid hammering the API on large runs.
+    with _campaign_vars_lock:
+        should_register = campaign_id not in _campaign_vars_registered
+        if should_register:
+            _campaign_vars_registered.add(campaign_id)
+    if should_register:
+        ensure_campaign_variables(
+            api_key,
+            campaign_id,
+            variables=["postalCode", "jobTitle", "address", "City", "state"],
+            debug=debug,
+        )
 
     formatted_leads = []
     for lead in leads:
+        lead = sanitize_for_json(lead)  # critical: strips NaN/NaT/Infinity before requests JSON encoding
         raw_name = lead.get("key_contact_name")
         if not isinstance(raw_name, str):
             raw_name = ""
@@ -142,8 +210,8 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
         # Drop empty values to keep payload clean. Also drop NaNs (float) to avoid JSON errors or "nan" strings.
         # NaN != NaN is the standard python check for nan float.
         def is_valid(v):
-            if v in (None, "", []): return False
-            if isinstance(v, float) and v != v: return False
+            if v in (None, "", [], "[undefined]"):
+                return False
             return True
 
         custom_variables = {k: v for k, v in custom_variables.items() if is_valid(v)}
@@ -163,13 +231,14 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
         )
 
     payload = {"campaign_id": campaign_id, "skip_if_in_campaign": True, "leads": formatted_leads}
+    payload = sanitize_for_json(payload)
 
     if debug:
         st.write(f"📤 Debug: Sending {len(leads)} leads to Instantly...")
         st.json(payload)
 
     def _post(payload_to_send):
-        return requests.post(url, headers=headers, json=payload_to_send, timeout=30)
+        return _request_with_retry("POST", url, headers=headers, json_payload=payload_to_send, timeout=30)
 
     try:
         resp = _post(payload)
@@ -223,7 +292,7 @@ def get_lead_from_instantly(api_key, lead_id, debug=False):
     headers = _headers(api_key)
 
     try:
-        resp = requests.get(url, headers=headers, timeout=20)
+        resp = _request_with_retry("GET", url, headers=headers, timeout=20)
         if resp.status_code == 200:
             return resp.json(), None
         return None, f"Instantly get lead failed: {resp.status_code} - {resp.text}"
@@ -254,7 +323,8 @@ def update_lead_in_instantly(api_key, lead_id, lead_data, debug=False):
     headers = _headers(api_key)
 
     try:
-        resp = requests.patch(url, headers=headers, json=lead_data, timeout=20)
+        lead_data = sanitize_for_json(lead_data)
+        resp = _request_with_retry("PATCH", url, headers=headers, json_payload=lead_data, timeout=20)
         if resp.status_code == 200:
             if debug:
                 st.write(f"✅ Updated lead {lead_id} in Instantly.")
@@ -285,7 +355,7 @@ def delete_lead_from_instantly(api_key, lead_id, debug=False):
     headers = {"Authorization": f"Bearer {api_key}"}
 
     try:
-        resp = requests.delete(url, headers=headers, timeout=20)
+        resp = _request_with_retry("DELETE", url, headers=headers, timeout=20)
         if resp.status_code == 200 or resp.status_code == 204:
             if debug:
                 st.write(f"✅ Deleted lead {lead_id} from Instantly.")

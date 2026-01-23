@@ -4,6 +4,8 @@ import requests
 import streamlit as st
 from pyairtable import Api
 
+from .json_sanitize import find_non_json_numbers, sanitize_for_json
+
 
 def init_airtable(api_key: str, base_id: str, leads_table: str, log_table: str):
     """Initialize Airtable API connection."""
@@ -170,12 +172,20 @@ def batch_update_leads(table_leads, updates):
              e.g. [{'id': 'rec...', 'fields': {'col': 'val'}}]
     """
     try:
+        updates = sanitize_for_json(updates)
         # pyairtable's batch_update takes a list of dicts: {'id': '...', 'fields': {...}}
         # Enable typecast to allow fuzzy matching (e.g. string numbers, new select options if allowed)
         table_leads.batch_update(updates, typecast=True)
         return True
     except Exception as e:
-        st.error(f"Error updating leads: {e}")
+        # Better debugging for the common NaN/Infinity JSON failure.
+        hits = find_non_json_numbers(updates, max_hits=20)
+        if hits:
+            st.error(f"Error updating leads: {e} (non-JSON numbers detected: {len(hits)} shown below)")
+            for path, val_repr in hits:
+                st.write(f"- {path}: {val_repr}")
+        else:
+            st.error(f"Error updating leads: {e}")
         return False
 
 
@@ -221,7 +231,7 @@ def log_transaction(
         if st.session_state.get("debug_mode"):
             st.write("📝 Debug: Writing Log to Airtable:", log_data)
 
-        table_log.create(log_data)
+        table_log.create(sanitize_for_json(log_data))
     except Exception as e:
         msg = f"Failed to write log: {e}"
         st.error(msg)
