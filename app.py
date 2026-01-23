@@ -286,13 +286,13 @@ def main():
                          if isinstance(industry, list): 
                              industry = industry[0]
                          
-                         # Campaign ID
+                         # Campaign ID - use lock to prevent race condition creating duplicates
                          camp_name = f"{industry} - Cold Outreach"
                          with campaign_lock:
                              c_id = campaign_cache.get(camp_name)
-                         if not c_id:
-                             c_id = find_or_create_instantly_campaign(secrets["instantly_key"], camp_name, debug=debug_mode)
-                             with campaign_lock:
+                             if not c_id:
+                                 # API call inside lock so only one thread can create a campaign at a time
+                                 c_id = find_or_create_instantly_campaign(secrets["instantly_key"], camp_name, debug=debug_mode)
                                  campaign_cache[camp_name] = c_id
                          if not c_id:
                              return {

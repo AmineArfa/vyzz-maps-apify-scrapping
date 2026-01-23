@@ -117,31 +117,80 @@ def ensure_campaign_variables(api_key: str, campaign_id: str, variables: list[st
         return False, err
 
 
+def _list_all_campaigns(api_key, debug=False):
+    """
+    Fetch ALL campaigns with pagination.
+    Returns list of campaign dicts, or None on failure.
+    """
+    headers = _headers(api_key)
+    url = f"{BASE_URL}/api/v2/campaigns"
+    all_campaigns = []
+    skip = 0
+    limit = 100
+    max_pages = 50  # Safety limit: 5000 campaigns max
+    
+    for _ in range(max_pages):
+        try:
+            resp = _request_with_retry(
+                "GET", url, headers=headers, 
+                params={"limit": limit, "skip": skip}, 
+                timeout=20
+            )
+            if resp.status_code != 200:
+                if debug:
+                    st.write(f"⚠️ Campaign list failed: {resp.status_code}")
+                return None  # Fail - don't risk creating duplicates
+            
+            payload = resp.json()
+            items = payload.get("items", payload if isinstance(payload, list) else [])
+            if not items:
+                break  # No more pages
+            
+            all_campaigns.extend(items)
+            skip += limit
+            
+            # If we got fewer than limit, we're done
+            if len(items) < limit:
+                break
+                
+        except Exception as e:
+            if debug:
+                st.write(f"⚠️ Campaign list exception: {e}")
+            return None  # Fail - don't risk creating duplicates
+    
+    return all_campaigns
+
+
 def find_or_create_instantly_campaign(api_key, campaign_name, debug=False):
-    """Finds a campaign by name or creates it. Returns: campaign_id"""
+    """
+    Finds a campaign by name or creates it. Returns: campaign_id or None.
+    
+    IMPORTANT: This function will return None (fail) rather than risk creating
+    a duplicate campaign if it can't verify whether the campaign already exists.
+    """
     if not api_key:
         return None
 
     headers = _headers(api_key)
 
-    try:
-        # Instantly v2: GET /api/v2/campaigns
-        url = f"{BASE_URL}/api/v2/campaigns"
-        resp = _request_with_retry("GET", url, headers=headers, params={"limit": 100}, timeout=20)
-        if resp.status_code == 200:
-            payload = resp.json()
-            campaigns = payload.get("items", payload if isinstance(payload, list) else [])
-            for c in campaigns:
-                if c.get("name") == campaign_name:
-                    if debug:
-                        st.write(f"✅ Found existing campaign: {campaign_name}")
-                    return c.get("id")
-    except Exception as e:
+    # Step 1: List ALL campaigns (with pagination) to find existing one
+    campaigns = _list_all_campaigns(api_key, debug=debug)
+    
+    if campaigns is None:
+        # Could not list campaigns - DO NOT create to avoid duplicates
         if debug:
-            st.write(f"⚠️ Failed to list campaigns: {e}")
-
+            st.write(f"❌ Cannot verify if campaign '{campaign_name}' exists - aborting to prevent duplicates")
+        return None
+    
+    # Search for existing campaign by name
+    for c in campaigns:
+        if c.get("name") == campaign_name:
+            if debug:
+                st.write(f"✅ Found existing campaign: {campaign_name}")
+            return c.get("id")
+    
+    # Step 2: Campaign not found - create it
     try:
-        # Instantly v2: POST /api/v2/campaigns requires name + campaign_schedule
         url = f"{BASE_URL}/api/v2/campaigns"
         data = {"name": campaign_name, "campaign_schedule": _default_campaign_schedule()}
         resp = _request_with_retry("POST", url, headers=headers, json_payload=data, timeout=30)
