@@ -180,6 +180,7 @@ def sync_pending_leads(
     *,
     secrets: dict,
     debug_mode: bool,
+    max_records: int = 5000,
     status,
 ):
     timestamp_now = pd.Timestamp.now(tz="UTC").isoformat()
@@ -187,6 +188,16 @@ def sync_pending_leads(
 
     reset_campaign_cache()
     status.write("📋 Loading existing campaigns...")
+
+    total_all = len(pending_records)
+    skipped = 0
+    if max_records and total_all > max_records:
+        skipped = total_all - max_records
+        pending_records = pending_records[:max_records]
+        status.write(
+            f"🧭 Sync cap: processing {max_records} of {total_all} leads "
+            f"({skipped} deferred to next refresh)."
+        )
 
     total = len(pending_records)
     completed = 0
@@ -276,6 +287,7 @@ def sync_pending_leads(
         "timestamp": pd.Timestamp.now().strftime("%H:%M:%S"),
         "count": success_count,
         "failures": len(failure_rows),
+        "skipped": skipped,
         "failure_counts": dict(failure_counts),
         "failure_samples": dict(failure_samples),
         "details": results,

@@ -19,6 +19,7 @@ from leadgen.sync_manager import sync_pending_leads
 AIRTABLE_LEADS_TABLE = "tblKrC9hOxCuMMyZT"
 AIRTABLE_LOG_TABLE = "log"
 SCRAPPING_TOOL_ID = "maps_apify_apollo"
+MAX_SYNC_PER_RUN = 5000
 
 
 st.set_page_config(page_title="Lead Generation Engine", page_icon="🚀", layout="wide")
@@ -225,6 +226,11 @@ def main():
         pending_df = df[pending_mask]
         
         pending_count = len(pending_df)
+        if pending_count > MAX_SYNC_PER_RUN:
+            st.warning(
+                f"Sync is capped at {MAX_SYNC_PER_RUN} leads per run. "
+                f"{pending_count - MAX_SYNC_PER_RUN} will remain pending for the next refresh."
+            )
         
         col_header, col_btn = st.columns([3, 1])
         with col_header:
@@ -240,6 +246,7 @@ def main():
                          table_leads,
                          secrets=secrets,
                          debug_mode=debug_mode,
+                        max_records=MAX_SYNC_PER_RUN,
                          status=status,
                      )
                      if sync_result.get("error"):
@@ -282,8 +289,10 @@ def main():
             res = st.session_state["last_sync_results"]
             st.divider()
             failures = res.get("failures", 0)
+            skipped = res.get("skipped", 0)
+            deferred_text = f" / {skipped} Deferred" if skipped else ""
             with st.expander(
-                f"📋 Last Sync Log ({res['timestamp']}) - {res['count']} Successes / {failures} Failures",
+                f"📋 Last Sync Log ({res['timestamp']}) - {res['count']} Successes / {failures} Failures{deferred_text}",
                 expanded=True,
             ):
                 fc = res.get("failure_counts") or {}
