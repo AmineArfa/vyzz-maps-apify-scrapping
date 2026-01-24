@@ -304,84 +304,86 @@ def main():
                          # Instantly Logic
                          if lead_id_instantly and is_valid_uuid(lead_id_instantly):
                              # Scenario: Existing Sync (Valid UUID)
-                             if has_email_mark and clean_data.get("key_contact_email"):
-                                 # 1. Fetch current lead from Instantly to check email
-                                 inst_lead, get_err = get_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
-                                 
-                                 email_changed = False
-                                 if inst_lead:
-                                     inst_email = inst_lead.get("email")
-                                     if inst_email and inst_email.lower() != clean_data["key_contact_email"].lower():
-                                         email_changed = True
-                                 elif "404" in str(get_err) or "not found" in str(get_err).lower():
-                                     # Lead doesn't exist anymore anyway
-                                     email_changed = True 
+                            if has_email_mark and clean_data.get("key_contact_email"):
+                                # 1. Fetch current lead from Instantly to check email
+                                inst_lead, get_err = get_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
+                                
+                                email_changed = False
+                                if inst_lead:
+                                    inst_email = inst_lead.get("email")
+                                    if inst_email and inst_email.lower() != clean_data["key_contact_email"].lower():
+                                        email_changed = True
+                                elif "404" in str(get_err) or "not found" in str(get_err).lower():
+                                    # Lead doesn't exist anymore anyway
+                                    email_changed = True
 
-                                 if email_changed:
-                                     # DELETE and RE-POST (identity change)
-                                     operation = "Create"
-                                     delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
-                                     
-                                     cnt, created, _, create_err = export_leads_to_instantly(
-                                         secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
-                                     )
-                                     if cnt > 0 and created:
-                                         new_instantly_id = created[0].get("id")
-                                     else:
-                                         return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, RE-POST failed: {create_err}"}
-                                 else:
-                                     # PATCH (same email or typo fix)
-                                     operation = "Update"
-                                     raw_name = clean_data.get("key_contact_name", "")
-                                     name_parts = str(raw_name).split(" ")
-                                     first_name = name_parts[0] if name_parts else ""
-                                     last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
-                                     
-                                     custom_vars = {
-                                         "postalCode": clean_data.get("postal_code"),
-                                         "jobTitle": clean_data.get("key_contact_position"),
-                                         "address": clean_data.get("postal_address"),
-                                         "City": clean_data.get("city"),
-                                         "state": clean_data.get("state"),
-                                     }
-                                     custom_vars = {k: v for k, v in custom_vars.items() if v not in (None, "", [], {})}
-                                     
-                                     patch_payload = {
-                                         "email": clean_data.get("key_contact_email"),
-                                         "first_name": first_name,
-                                         "last_name": last_name,
-                                         "company_name": clean_data.get("company_name"),
-                                         "website": clean_data.get("website"),
-                                         "phone": clean_data.get("generic_phone"),
-                                         "custom_variables": custom_vars or None,
-                                     }
-                                     patch_payload = sanitize_for_json(patch_payload)
-                                     success, err = update_lead_in_instantly(
-                                         secrets["instantly_key"], lead_id_instantly, patch_payload, debug=debug_mode
-                                     )
-                                     if not success:
-                                         # Fallback (repeat check just in case it 404'd between GET and PATCH)
-                                         if "404" in str(err) or "not found" in str(err).lower():
-                                             operation = "Create"
-                                             cnt, created, _, create_err = export_leads_to_instantly(
-                                                 secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
-                                             )
-                                             if cnt > 0 and created:
-                                                 new_instantly_id = created[0].get("id")
-                                             else:
-                                                 return {"id": lead_id_airtable, "status": "Failed", "error": f"Update failed (404), Create failed: {create_err}"}
-                                         else:
-                                             return {"id": lead_id_airtable, "status": "Failed", "error": err}
-                             else:
-                                 # DELETE
-                                 operation = "Delete"
-                                 success, err = delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly, debug=debug_mode)
-                                 new_instantly_id = None # Clear it
-                                 if not success:
-                                     if "not found" in str(err).lower():
-                                         new_instantly_id = None
-                                     else:
-                                         return {"id": lead_id_airtable, "status": "Failed", "error": f"Delete Failed: {err}"}
+                                if email_changed:
+                                    # DELETE and RE-POST (identity change)
+                                    operation = "Create"
+                                    delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
+                                    
+                                    cnt, created, _, create_err = export_leads_to_instantly(
+                                        secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
+                                    )
+                                    if cnt > 0 and created:
+                                        new_instantly_id = created[0].get("id")
+                                    else:
+                                        return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, RE-POST failed: {create_err}"}
+                                else:
+                                    # PATCH (same email or typo fix)
+                                    operation = "Update"
+                                    raw_name = clean_data.get("key_contact_name", "")
+                                    name_parts = str(raw_name).split(" ")
+                                    first_name = name_parts[0] if name_parts else ""
+                                    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+                                    
+                                    custom_vars = {
+                                        "postalCode": clean_data.get("postal_code"),
+                                        "jobTitle": clean_data.get("key_contact_position"),
+                                        "address": clean_data.get("postal_address"),
+                                        "City": clean_data.get("city"),
+                                        "state": clean_data.get("state"),
+                                    }
+                                    custom_vars = {k: v for k, v in custom_vars.items() if v not in (None, "", [], {})}
+                                    
+                                    patch_payload = {
+                                        "email": clean_data.get("key_contact_email"),
+                                        "first_name": first_name,
+                                        "last_name": last_name,
+                                        "company_name": clean_data.get("company_name"),
+                                        "website": clean_data.get("website"),
+                                        "phone": clean_data.get("generic_phone"),
+                                        "custom_variables": custom_vars or None,
+                                    }
+                                    patch_payload = sanitize_for_json(patch_payload)
+                                    success, err = update_lead_in_instantly(
+                                        secrets["instantly_key"], lead_id_instantly, patch_payload, debug=debug_mode
+                                    )
+                                    if not success:
+                                        # Fallback: if PATCH fails for any reason (404, email conflict, etc.),
+                                        # create a NEW contact in Instantly and update Airtable with the new ID.
+                                        # This handles cases where email was modified but PATCH doesn't support email changes.
+                                        operation = "Create"
+                                        # Try to delete the old lead first (ignore errors - it may already be gone)
+                                        delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
+                                        
+                                        cnt, created, _, create_err = export_leads_to_instantly(
+                                            secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
+                                        )
+                                        if cnt > 0 and created:
+                                            new_instantly_id = created[0].get("id")
+                                        else:
+                                            return {"id": lead_id_airtable, "status": "Failed", "error": f"Update failed ({err}), Create also failed: {create_err}"}
+                            else:
+                                # DELETE
+                                operation = "Delete"
+                                success, err = delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly, debug=debug_mode)
+                                new_instantly_id = None  # Clear it
+                                if not success:
+                                    if "not found" in str(err).lower():
+                                        new_instantly_id = None
+                                    else:
+                                        return {"id": lead_id_airtable, "status": "Failed", "error": f"Delete Failed: {err}"}
                          else:
                              # Scenario: No Sync yet OR Invalid ID (Treat as New)
                              if has_email_mark and clean_data.get("key_contact_email"):
