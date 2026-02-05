@@ -14,6 +14,7 @@ from .instantly import (
     get_lead_from_instantly,
     is_valid_uuid,
     reset_campaign_cache,
+    search_lead_by_email,
     update_lead_in_instantly,
 )
 from .json_sanitize import sanitize_for_json
@@ -31,11 +32,56 @@ def _classify_error(err: str | None) -> str:
         return "invalid_id"
     if "not found" in msg or "404" in msg:
         return "not_found"
+    if "email changed" in msg or "create failed" in msg:
+        return "email_change"
+    if "duplicate" in msg or "already exists" in msg:
+        return "duplicate"
     return "other"
 
 
+def _build_patch_payload(clean_data: dict) -> dict:
+    """Build a PATCH payload from clean_data."""
+    raw_name = clean_data.get("key_contact_name", "")
+    name_parts = str(raw_name).split(" ")
+    first_name = name_parts[0] if name_parts else ""
+    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+
+    custom_vars = {
+        "postalCode": clean_data.get("postal_code"),
+        "jobTitle": clean_data.get("key_contact_position"),
+        "address": clean_data.get("postal_address"),
+        "City": clean_data.get("city"),
+        "state": clean_data.get("state"),
+        "competitor1": clean_data.get("competitor1"),
+        "competitor2": clean_data.get("competitor2"),
+        "competitor3": clean_data.get("competitor3"),
+    }
+    custom_vars = {k: v for k, v in custom_vars.items() if v not in (None, "", [], {})}
+
+    return sanitize_for_json({
+        "email": clean_data.get("key_contact_email"),
+        "first_name": first_name,
+        "last_name": last_name,
+        "company_name": clean_data.get("company_name"),
+        "website": clean_data.get("website"),
+        "phone": clean_data.get("generic_phone"),
+        "custom_variables": custom_vars or None,
+    })
+
+
 def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
+    """
+    Process a single lead for sync to Instantly.
+    
+    Handles all scenarios:
+    - New lead with email that may or may not exist in Instantly
+    - Existing lead with same email (update)
+    - Existing lead with changed email (delete old + create/link new)
+    - Duplicate emails (link to existing Instantly lead)
+    - Lead removal (delete from Instantly)
+    """
     clean_data = sanitize_for_json(lead or {})
+    api_key = secrets["instantly_key"]
 
     lead_id_airtable = clean_data.get("id")
     lead_id_instantly = clean_data.get("instantly_lead_id")
@@ -44,6 +90,10 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
     email = clean_data.get("key_contact_email")
     if not isinstance(email, str) or not email.strip():
         clean_data["key_contact_email"] = None
+        email = None
+    else:
+        email = email.strip().lower()
+        clean_data["key_contact_email"] = email
 
     industry = clean_data.get("industry")
     if not industry:
@@ -53,7 +103,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
 
     # Campaign ID - module-level lock in instantly.py prevents duplicates
     camp_name = f"{industry} - Cold Outreach"
-    c_id = find_or_create_instantly_campaign(secrets["instantly_key"], camp_name, debug=debug_mode)
+    c_id = find_or_create_instantly_campaign(api_key, camp_name, debug=debug_mode)
     if not c_id:
         return {
             "id": lead_id_airtable,
@@ -65,104 +115,119 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
     new_instantly_id = lead_id_instantly
     operation = "Skip"
 
-    # Instantly Logic
+    # =========================================================================
+    # SCENARIO A: Has valid instantly_lead_id (existing sync)
+    # =========================================================================
     if lead_id_instantly and is_valid_uuid(lead_id_instantly):
-        # Scenario: Existing Sync (Valid UUID)
-        if has_email_mark and clean_data.get("key_contact_email"):
-            # 1. Fetch current lead from Instantly to check email
-            inst_lead, get_err = get_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
-
-            email_changed = False
-            if inst_lead:
-                inst_email = inst_lead.get("email")
-                if inst_email and inst_email.lower() != clean_data["key_contact_email"].lower():
-                    email_changed = True
-            elif "404" in str(get_err) or "not found" in str(get_err).lower():
-                # Lead doesn't exist anymore anyway
-                email_changed = True
-
-            if email_changed:
-                # DELETE and RE-POST (identity change)
-                operation = "Create"
-                delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
-
-                cnt, created, _, create_err = export_leads_to_instantly(
-                    secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
-                )
-                if cnt > 0 and created:
-                    new_instantly_id = created[0].get("id")
-                else:
-                    return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, RE-POST failed: {create_err}"}
-            else:
-                # PATCH (same email or typo fix)
+        
+        # A1: Should have email in Instantly
+        if has_email_mark and email:
+            # Fetch current lead from Instantly
+            inst_lead, get_err = get_lead_from_instantly(api_key, lead_id_instantly)
+            lead_exists_in_instantly = inst_lead is not None
+            inst_email = (inst_lead.get("email") or "").lower() if inst_lead else None
+            
+            # Determine if email changed
+            email_matches = inst_email and inst_email == email
+            
+            if lead_exists_in_instantly and email_matches:
+                # A1a: Lead exists and email matches -> PATCH update
                 operation = "Update"
-                raw_name = clean_data.get("key_contact_name", "")
-                name_parts = str(raw_name).split(" ")
-                first_name = name_parts[0] if name_parts else ""
-                last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
-
-                custom_vars = {
-                    "postalCode": clean_data.get("postal_code"),
-                    "jobTitle": clean_data.get("key_contact_position"),
-                    "address": clean_data.get("postal_address"),
-                    "City": clean_data.get("city"),
-                    "state": clean_data.get("state"),
-                }
-                custom_vars = {k: v for k, v in custom_vars.items() if v not in (None, "", [], {})}
-
-                patch_payload = {
-                    "email": clean_data.get("key_contact_email"),
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "company_name": clean_data.get("company_name"),
-                    "website": clean_data.get("website"),
-                    "phone": clean_data.get("generic_phone"),
-                    "custom_variables": custom_vars or None,
-                }
-                patch_payload = sanitize_for_json(patch_payload)
-                success, err = update_lead_in_instantly(
-                    secrets["instantly_key"], lead_id_instantly, patch_payload, debug=debug_mode
-                )
+                patch_payload = _build_patch_payload(clean_data)
+                success, err = update_lead_in_instantly(api_key, lead_id_instantly, patch_payload, debug=debug_mode)
+                
                 if not success:
-                    # Fallback: if PATCH fails for any reason (404, email conflict, etc.),
-                    # create a NEW contact in Instantly and update Airtable with the new ID.
-                    # This handles cases where email was modified but PATCH doesn't support email changes.
+                    # PATCH failed - try delete + create as fallback
                     operation = "Create"
-                    # Try to delete the old lead first (ignore errors - it may already be gone)
-                    delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly)
-
-                    cnt, created, _, create_err = export_leads_to_instantly(
-                        secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
-                    )
+                    delete_lead_from_instantly(api_key, lead_id_instantly)
+                    cnt, created, _, create_err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
                     if cnt > 0 and created:
                         new_instantly_id = created[0].get("id")
                     else:
-                        return {"id": lead_id_airtable, "status": "Failed", "error": f"Update failed ({err}), Create also failed: {create_err}"}
-        else:
-            # DELETE
-            operation = "Delete"
-            success, err = delete_lead_from_instantly(secrets["instantly_key"], lead_id_instantly, debug=debug_mode)
-            new_instantly_id = None  # Clear it
-            if not success:
-                if "not found" in str(err).lower():
-                    new_instantly_id = None
+                        # Check if email now exists (race condition or duplicate)
+                        existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+                        if existing:
+                            new_instantly_id = existing.get("id")
+                            operation = "Link"
+                        else:
+                            return {"id": lead_id_airtable, "status": "Failed", "error": f"Update failed ({err}), Create also failed: {create_err}"}
+            else:
+                # A1b: Email changed OR lead doesn't exist in Instantly anymore
+                # First, check if new email already exists in Instantly
+                existing_with_new_email, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+                
+                if existing_with_new_email:
+                    # New email already exists -> Link to existing, delete old
+                    operation = "Link"
+                    new_instantly_id = existing_with_new_email.get("id")
+                    
+                    # Delete old lead if it still exists and is different
+                    if lead_exists_in_instantly and new_instantly_id != lead_id_instantly:
+                        delete_lead_from_instantly(api_key, lead_id_instantly)
                 else:
-                    return {"id": lead_id_airtable, "status": "Failed", "error": f"Delete Failed: {err}"}
-    else:
-        # Scenario: No Sync yet OR Invalid ID (Treat as New)
-        if has_email_mark and clean_data.get("key_contact_email"):
-            # POST
-            operation = "Create"
-            cnt, created, _, err = export_leads_to_instantly(
-                secrets["instantly_key"], c_id, [clean_data], debug=debug_mode
-            )
-            if cnt > 0 and created:
-                new_instantly_id = created[0].get("id")
-            elif err:
-                return {"id": lead_id_airtable, "status": "Failed", "error": f"Create Failed: {err}"}
-        elif lead_id_instantly:
-            # We have an invalid ID but no email to sync. Just clear the garbage ID.
+                    # New email doesn't exist -> Delete old + Create new
+                    operation = "Create"
+                    if lead_exists_in_instantly:
+                        delete_lead_from_instantly(api_key, lead_id_instantly)
+                    
+                    cnt, created, _, create_err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
+                    if cnt > 0 and created:
+                        new_instantly_id = created[0].get("id")
+                    else:
+                        # Double-check: maybe it was created by another thread/process
+                        existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+                        if existing:
+                            new_instantly_id = existing.get("id")
+                            operation = "Link"
+                        else:
+                            return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, create failed: {create_err}"}
+        else:
+            # A2: No email -> DELETE from Instantly
+            operation = "Delete"
+            success, err = delete_lead_from_instantly(api_key, lead_id_instantly, debug=debug_mode)
             new_instantly_id = None
+            if not success and "not found" not in str(err).lower():
+                return {"id": lead_id_airtable, "status": "Failed", "error": f"Delete Failed: {err}"}
+    
+    # =========================================================================
+    # SCENARIO B: No instantly_lead_id or invalid (new sync)
+    # =========================================================================
+    else:
+        if has_email_mark and email:
+            # B1: Has email -> Check if it already exists in Instantly
+            existing_lead, search_err = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+            
+            if existing_lead:
+                # B1a: Email already exists in Instantly -> Link to it
+                operation = "Link"
+                new_instantly_id = existing_lead.get("id")
+            else:
+                # B1b: Email doesn't exist -> Create new lead
+                operation = "Create"
+                cnt, created, _, err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
+                if cnt > 0 and created:
+                    new_instantly_id = created[0].get("id")
+                elif err:
+                    # Final check: maybe created by race condition
+                    existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+                    if existing:
+                        new_instantly_id = existing.get("id")
+                        operation = "Link"
+                    else:
+                        return {"id": lead_id_airtable, "status": "Failed", "error": f"Create Failed: {err}"}
+                else:
+                    # cnt == 0 but no error - lead was skipped (already exists)
+                    # Search for it
+                    existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+                    if existing:
+                        new_instantly_id = existing.get("id")
+                        operation = "Link"
+                    else:
+                        new_instantly_id = None
+                        operation = "Skip"
+        else:
+            # B2: No email -> Nothing to sync
+            new_instantly_id = None if lead_id_instantly else lead_id_instantly
             operation = "Skip"
 
     return {
@@ -170,7 +235,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
         "status": "Success",
         "op": operation,
         "new_instantly_id": new_instantly_id,
-        "campaign_id": c_id if operation in ("Create", "Update") else None,
+        "campaign_id": c_id if operation in ("Create", "Update", "Link") else None,
     }
 
 
@@ -235,7 +300,7 @@ def sync_pending_leads(
             fields = {"last_synced_at": timestamp_now}
 
             op = res.get("op")
-            if op in ("Create", "Update"):
+            if op in ("Create", "Update", "Link"):
                 fields["instantly_statuts"] = "Success"
             elif op == "Delete":
                 fields["instantly_statuts"] = None  # Clear status on delete

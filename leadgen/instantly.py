@@ -294,7 +294,8 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
         ensure_campaign_variables(
             api_key,
             campaign_id,
-            variables=["postalCode", "jobTitle", "address", "City", "state"],
+            variables=["postalCode", "jobTitle", "address", "City", "state",
+                       "competitor1", "competitor2", "competitor3"],
             debug=debug,
         )
 
@@ -317,6 +318,9 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             "address": lead.get("postal_address"),
             "City": lead.get("city"),
             "state": lead.get("state"),
+            "competitor1": lead.get("competitor1"),
+            "competitor2": lead.get("competitor2"),
+            "competitor3": lead.get("competitor3"),
         }
         
         # Drop empty values to keep payload clean. Also drop NaNs (float) to avoid JSON errors or "nan" strings.
@@ -410,6 +414,50 @@ def get_lead_from_instantly(api_key, lead_id, debug=False):
         return None, f"Instantly get lead failed: {resp.status_code} - {resp.text}"
     except Exception as e:
         return None, f"Instantly get lead exception: {e}"
+
+
+def search_lead_by_email(api_key: str, email: str, campaign_id: str | None = None, debug: bool = False):
+    """
+    Search for a lead by email in Instantly.
+    Returns: (lead_dict, error_str) - lead_dict is None if not found or on error.
+    
+    Uses POST /api/v2/leads/list with email filter.
+    """
+    if not api_key or not email:
+        return None, "Missing api_key or email"
+
+    url = f"{BASE_URL}/api/v2/leads/list"
+    headers = _headers(api_key)
+
+    # Build search payload
+    payload = {
+        "email": email.strip().lower(),
+        "limit": 1,
+    }
+    if campaign_id:
+        payload["campaign_id"] = campaign_id
+
+    try:
+        resp = _request_with_retry("POST", url, headers=headers, json_payload=payload, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("items", data if isinstance(data, list) else [])
+            if items:
+                lead = items[0]
+                if debug:
+                    st.write(f"🔍 Found existing lead by email: {email} -> {lead.get('id')}")
+                return lead, None
+            # No match found
+            return None, None
+        err = f"Instantly search lead failed: {resp.status_code} - {resp.text}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return None, err
+    except Exception as e:
+        err = f"Instantly search lead exception: {e}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return None, err
 
 
 def is_valid_uuid(val):
