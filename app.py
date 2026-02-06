@@ -12,7 +12,7 @@ from leadgen.config import get_secrets
 from leadgen.credits import display_credit_dashboard
 from leadgen.dashboard import StatusDashboard
 from leadgen.runner import execute_with_credit_tracking
-from leadgen.sync_manager import sync_pending_leads
+from leadgen.sync_manager import sync_pending_leads, sync_with_verification
 
 
 # --- CONSTANTS & CONFIGURATION ---
@@ -54,6 +54,11 @@ def main():
         st.sidebar.success("Gemini Key Found")
     else:
         st.sidebar.warning("Gemini Key Missing (split disabled)")
+
+    if secrets.get("millionverifier_key"):
+        st.sidebar.success("MillionVerifier Key Found")
+    else:
+        st.sidebar.warning("MillionVerifier Key Missing (email verification disabled)")
 
     debug_mode = st.sidebar.checkbox("🔍 Debug Mode", value=False, help="Show API response details")
     st.session_state["debug_mode"] = debug_mode
@@ -241,14 +246,29 @@ def main():
              if st.button(f"🚀 Sync {pending_count} Updates", type="primary", disabled=pending_count == 0):
                  with st.status("Syncing to Instantly...", expanded=True) as status:
                      pending_records = pending_df.to_dict("records")
-                     sync_result = sync_pending_leads(
-                         pending_records,
-                         table_leads,
-                         secrets=secrets,
-                         debug_mode=debug_mode,
-                        max_records=MAX_SYNC_PER_RUN,
-                         status=status,
-                     )
+
+                     if secrets.get("millionverifier_key"):
+                         # Smart Verification & Delta Cleanup workflow
+                         sync_result = sync_with_verification(
+                             pending_records,
+                             table_leads,
+                             secrets=secrets,
+                             debug_mode=debug_mode,
+                             max_records=MAX_SYNC_PER_RUN,
+                             status=status,
+                         )
+                     else:
+                         # Fallback: no verification, sync directly
+                         st.warning("⚠️ MillionVerifier key missing – syncing without email verification.")
+                         sync_result = sync_pending_leads(
+                             pending_records,
+                             table_leads,
+                             secrets=secrets,
+                             debug_mode=debug_mode,
+                             max_records=MAX_SYNC_PER_RUN,
+                             status=status,
+                         )
+
                      if sync_result.get("error"):
                          st.error("Failed to update Airtable labels.")
                          st.stop()
@@ -274,11 +294,12 @@ def main():
                 column_order=[
                     "company_name", 
                     "industry", 
-                    "key_contact_email", 
+                    "key_contact_email",
+                    "verification_status",
                     "last_modified_at", 
                     "last_synced_at",
-                     "key_contact_name", 
-                    "key_contact_position"
+                    "key_contact_name", 
+                    "key_contact_position",
                 ] 
             )
         else:
@@ -290,11 +311,22 @@ def main():
             st.divider()
             failures = res.get("failures", 0)
             skipped = res.get("skipped", 0)
+            blocked = res.get("blocked", 0)
             deferred_text = f" / {skipped} Deferred" if skipped else ""
+            blocked_text = f" / {blocked} Blocked" if blocked else ""
             with st.expander(
-                f"📋 Last Sync Log ({res['timestamp']}) - {res['count']} Successes / {failures} Failures{deferred_text}",
+                f"📋 Last Sync Log ({res['timestamp']}) - {res['count']} Successes / {failures} Failures{blocked_text}{deferred_text}",
                 expanded=True,
             ):
+                # Blocked leads summary (from MillionVerifier)
+                if blocked:
+                    blocked_deleted = res.get("blocked_deleted", 0)
+                    st.write(
+                        f"**🛡️ Email Verification**: {blocked} leads blocked "
+                        f"({blocked_deleted} removed from Instantly)"
+                    )
+                    st.divider()
+
                 fc = res.get("failure_counts") or {}
                 if fc:
                     st.write("**Failure breakdown**")
@@ -310,6 +342,9 @@ def main():
                     if item.get("status") == "Success":
                         op = item.get("op", "Sync")
                         st.write(f"✅ **{item['id']}**: {op} successful")
+                    elif item.get("status") == "Blocked":
+                        v_status = item.get("verification_status", "bad")
+                        st.write(f"🛡️ **{item['id']}**: Blocked ({v_status})")
                     else:
                         st.error(f"❌ **{item['id']}**: {item.get('error') or item.get('status')}")
                 

@@ -13,6 +13,8 @@ def get_secrets():
             "instantly_key": st.secrets.get("INSTANTLY_API_KEY", ""),
             # Optional: Gemini key for zone splitting. Prefer Streamlit secrets; fallback to env var.
             "gemini_key": (st.secrets.get("GOOGLE_GENERATIVE_AI_API_KEY", "") or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY", "")).strip(),
+            # Optional: MillionVerifier key for email verification before Instantly sync.
+            "millionverifier_key": st.secrets.get("MILLIONVERIFIER_API_KEY", ""),
         }
     except FileNotFoundError:
         st.error("Secrets file not found. Please create `.streamlit/secrets.toml`.")

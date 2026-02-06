@@ -18,6 +18,7 @@ from .instantly import (
     update_lead_in_instantly,
 )
 from .json_sanitize import sanitize_for_json
+from .millionverifier import GOOD_STATUSES, verify_pending_leads
 
 
 def _classify_error(err: str | None) -> str:
@@ -356,4 +357,303 @@ def sync_pending_leads(
         "failure_counts": dict(failure_counts),
         "failure_samples": dict(failure_samples),
         "details": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MillionVerifier Gatekeeper – cleanup & orchestration
+# ---------------------------------------------------------------------------
+
+
+def _process_bad_lead(lead: dict, *, api_key: str, debug_mode: bool) -> dict:
+    """Handle a single bad lead: remove from Instantly if present.
+
+    Uses ``instantly_lead_id`` when available (fast path), otherwise falls
+    back to ``search_lead_by_email``.
+    """
+    clean = sanitize_for_json(lead or {})
+    airtable_id = clean.get("id")
+    instantly_id = clean.get("instantly_lead_id")
+    email = clean.get("key_contact_email")
+    if isinstance(email, str):
+        email = email.strip().lower() or None
+
+    deleted = False
+    error: str | None = None
+
+    # Fast path: we already know the Instantly lead ID
+    if instantly_id and is_valid_uuid(instantly_id):
+        ok, err = delete_lead_from_instantly(api_key, instantly_id, debug=debug_mode)
+        if ok:
+            deleted = True
+        elif "not found" in str(err or "").lower():
+            # Already gone – that's fine
+            deleted = False
+        else:
+            error = err
+    elif email:
+        # Slow path: search by email
+        found, search_err = search_lead_by_email(api_key, email, debug=debug_mode)
+        if found:
+            found_id = found.get("id")
+            if found_id:
+                ok, err = delete_lead_from_instantly(api_key, found_id, debug=debug_mode)
+                if ok:
+                    deleted = True
+                else:
+                    error = err
+        elif search_err:
+            error = search_err
+
+    return {
+        "id": airtable_id,
+        "deleted": deleted,
+        "error": error,
+    }
+
+
+def cleanup_bad_leads(
+    bad_leads: list[tuple[dict, str]],
+    table_leads,
+    *,
+    secrets: dict,
+    debug_mode: bool,
+    status,
+) -> dict:
+    """Remove bad leads from Instantly and update Airtable.
+
+    Parameters
+    ----------
+    bad_leads : list[tuple[dict, str]]
+        Each element is ``(record_dict, verification_status)``.
+    table_leads
+        Airtable table object for batch updates.
+    secrets : dict
+        Application secrets (needs ``instantly_key``).
+    debug_mode : bool
+        Whether to show debug output.
+    status
+        Streamlit status widget for progress messages.
+
+    Returns
+    -------
+    dict
+        Summary with ``deleted``, ``not_found``, ``errors``, ``details`` keys.
+    """
+    if not bad_leads:
+        return {"deleted": 0, "not_found": 0, "errors": 0, "details": []}
+
+    api_key = secrets["instantly_key"]
+    timestamp_now = pd.Timestamp.now(tz="UTC").isoformat()
+
+    status.write(f"🛡️ Cleaning up {len(bad_leads)} bad leads from Instantly...")
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(
+                _process_bad_lead, rec, api_key=api_key, debug_mode=debug_mode
+            ): (rec, v_status)
+            for rec, v_status in bad_leads
+        }
+        for future in as_completed(futures):
+            res = future.result()
+            rec, v_status = futures[future]
+            res["verification_status"] = v_status
+            results.append(res)
+
+    # Build Airtable updates
+    airtable_updates: list[dict] = []
+    deleted_count = 0
+    not_found_count = 0
+    error_count = 0
+
+    for res in results:
+        airtable_id = res["id"]
+        if not airtable_id:
+            continue
+
+        fields: dict = {
+            "verification_status": res["verification_status"],
+            "last_synced_at": timestamp_now,
+        }
+        # Clear Instantly references since the lead should not be there
+        fields["instantly_lead_id"] = None
+        fields["instantly_campaign_id"] = None
+        fields["instantly_statuts"] = "Blocked"
+
+        airtable_updates.append({"id": airtable_id, "fields": fields})
+
+        if res.get("error"):
+            error_count += 1
+            status.write(f"⚠️ {airtable_id}: cleanup error – {res['error']}")
+        elif res["deleted"]:
+            deleted_count += 1
+            status.write(f"🗑️ {airtable_id}: removed from Instantly ({res['verification_status']})")
+        else:
+            not_found_count += 1
+
+    # Batch update Airtable
+    if airtable_updates:
+        status.write(f"📝 Updating {len(airtable_updates)} bad-lead records in Airtable...")
+        if batch_update_leads(table_leads, airtable_updates):
+            status.write(
+                f"✅ Bad leads updated – {deleted_count} deleted from Instantly, "
+                f"{not_found_count} not found (already clean), {error_count} errors."
+            )
+        else:
+            status.write("❌ Airtable update for bad leads failed.")
+
+    return {
+        "deleted": deleted_count,
+        "not_found": not_found_count,
+        "errors": error_count,
+        "details": results,
+    }
+
+
+def sync_with_verification(
+    pending_records: list[dict],
+    table_leads,
+    *,
+    secrets: dict,
+    debug_mode: bool,
+    max_records: int = 5000,
+    status,
+) -> dict:
+    """Orchestrator: verify emails then sync good / clean up bad.
+
+    This replaces the direct ``sync_pending_leads()`` call when a
+    MillionVerifier API key is available.
+
+    Flow
+    ----
+    1. Verify pending records (hybrid: trust existing status / call API).
+    2. Split into *good* (``ok``) and *bad* (everything else).
+    3. Sync good leads via existing ``sync_pending_leads()``.
+    4. Clean up bad leads via ``cleanup_bad_leads()``.
+    5. Batch-update Airtable ``verification_status`` for API-verified good leads.
+    6. Merge and return combined results.
+    """
+    mv_key = secrets.get("millionverifier_key", "")
+    timestamp_now = pd.Timestamp.now(tz="UTC").isoformat()
+
+    # ── Cap records ──────────────────────────────────────────────────────
+    total_all = len(pending_records)
+    skipped = 0
+    if max_records and total_all > max_records:
+        skipped = total_all - max_records
+        pending_records = pending_records[:max_records]
+        status.write(
+            f"🧭 Sync cap: processing {max_records} of {total_all} leads "
+            f"({skipped} deferred to next refresh)."
+        )
+
+    # ── Step 1: Verification ─────────────────────────────────────────────
+    status.write(f"🔍 Verifying {len(pending_records)} emails with MillionVerifier...")
+    progress_bar = st.progress(0, text="Verifying emails...")
+
+    def _on_verify_progress(done: int, total: int):
+        progress_bar.progress(
+            min(done / total, 1.0) if total else 1.0,
+            text=f"Verified {done}/{total} emails",
+        )
+
+    verified = verify_pending_leads(
+        pending_records,
+        mv_key,
+        max_workers=15,
+        on_progress=_on_verify_progress,
+    )
+
+    # ── Step 2: Split good / bad ─────────────────────────────────────────
+    good_leads: list[dict] = []
+    good_api_verified_ids: list[str] = []  # Airtable IDs needing verification_status='ok'
+    bad_leads: list[tuple[dict, str]] = []  # (record, status)
+
+    for rec, v_status, was_api in verified:
+        if v_status in GOOD_STATUSES:
+            good_leads.append(rec)
+            if was_api:
+                airtable_id = rec.get("id")
+                if airtable_id:
+                    good_api_verified_ids.append(airtable_id)
+        else:
+            bad_leads.append((rec, v_status))
+
+    status.write(
+        f"📊 Verification results: {len(good_leads)} good (ok) / "
+        f"{len(bad_leads)} bad (blocked)"
+    )
+
+    # ── Step 3: Sync good leads ──────────────────────────────────────────
+    sync_result: dict = {}
+    if good_leads:
+        status.write(f"🚀 Syncing {len(good_leads)} verified leads to Instantly...")
+        sync_result = sync_pending_leads(
+            good_leads,
+            table_leads,
+            secrets=secrets,
+            debug_mode=debug_mode,
+            max_records=max_records,
+            status=status,
+        )
+        if sync_result.get("error"):
+            return sync_result  # propagate fatal Airtable error
+    else:
+        status.write("ℹ️ No good leads to sync to Instantly.")
+
+    # ── Step 4: Clean up bad leads ───────────────────────────────────────
+    cleanup_result: dict = {}
+    if bad_leads:
+        cleanup_result = cleanup_bad_leads(
+            bad_leads,
+            table_leads,
+            secrets=secrets,
+            debug_mode=debug_mode,
+            status=status,
+        )
+    else:
+        status.write("ℹ️ No bad leads to clean up.")
+
+    # ── Step 5: Persist verification_status for API-verified good leads ──
+    if good_api_verified_ids:
+        mv_updates = [
+            {"id": aid, "fields": {"verification_status": "ok"}}
+            for aid in good_api_verified_ids
+        ]
+        status.write(
+            f"📝 Saving verification_status='ok' for {len(mv_updates)} "
+            f"newly verified leads..."
+        )
+        if not batch_update_leads(table_leads, mv_updates):
+            status.write("⚠️ Failed to persist verification_status for good leads.")
+
+    # ── Step 6: Merge results ────────────────────────────────────────────
+    sync_details = sync_result.get("details", []) if sync_result else []
+    bad_details = [
+        {
+            "id": r["id"],
+            "status": "Blocked",
+            "op": "Blocked",
+            "error": r.get("error"),
+            "verification_status": r.get("verification_status"),
+        }
+        for r in cleanup_result.get("details", [])
+    ]
+
+    all_details = sync_details + bad_details
+
+    status.update(label="✅ Sync Complete!", state="complete", expanded=False)
+
+    return {
+        "timestamp": pd.Timestamp.now().strftime("%H:%M:%S"),
+        "count": sync_result.get("count", 0),
+        "failures": sync_result.get("failures", 0),
+        "skipped": skipped,
+        "blocked": len(bad_leads),
+        "blocked_deleted": cleanup_result.get("deleted", 0),
+        "failure_counts": sync_result.get("failure_counts", {}),
+        "failure_samples": sync_result.get("failure_samples", {}),
+        "details": all_details,
     }
