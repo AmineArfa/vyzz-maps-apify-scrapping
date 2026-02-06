@@ -365,11 +365,20 @@ def sync_pending_leads(
 # ---------------------------------------------------------------------------
 
 
+def _is_not_found_error(err: str | None) -> bool:
+    """Return True if the error indicates the lead was already gone (404)."""
+    msg = str(err or "").lower()
+    return "not found" in msg or "404" in msg
+
+
 def _process_bad_lead(lead: dict, *, api_key: str, debug_mode: bool) -> dict:
     """Handle a single bad lead: remove from Instantly if present.
 
     Uses ``instantly_lead_id`` when available (fast path), otherwise falls
     back to ``search_lead_by_email``.
+
+    A 404 / "not found" from Instantly is treated as success – the lead is
+    already gone, which is the desired outcome.
     """
     clean = sanitize_for_json(lead or {})
     airtable_id = clean.get("id")
@@ -386,8 +395,8 @@ def _process_bad_lead(lead: dict, *, api_key: str, debug_mode: bool) -> dict:
         ok, err = delete_lead_from_instantly(api_key, instantly_id, debug=debug_mode)
         if ok:
             deleted = True
-        elif "not found" in str(err or "").lower():
-            # Already gone – that's fine
+        elif _is_not_found_error(err):
+            # Already gone – that's the desired state, not an error.
             deleted = False
         else:
             error = err
@@ -400,9 +409,12 @@ def _process_bad_lead(lead: dict, *, api_key: str, debug_mode: bool) -> dict:
                 ok, err = delete_lead_from_instantly(api_key, found_id, debug=debug_mode)
                 if ok:
                     deleted = True
+                elif _is_not_found_error(err):
+                    # Gone between search and delete – still fine.
+                    deleted = False
                 else:
                     error = err
-        elif search_err:
+        elif search_err and not _is_not_found_error(search_err):
             error = search_err
 
     return {
