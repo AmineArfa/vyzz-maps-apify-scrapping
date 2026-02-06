@@ -475,23 +475,29 @@ def cleanup_bad_leads(
 
         fields: dict = {
             "verification_status": res["verification_status"],
+            # ALWAYS update last_synced_at so the lead leaves the pending
+            # backlog regardless of whether the Instantly delete succeeded.
             "last_synced_at": timestamp_now,
+            "instantly_statuts": "Blocked",
         }
-        # Clear Instantly references since the lead should not be there
-        fields["instantly_lead_id"] = None
-        fields["instantly_campaign_id"] = None
-        fields["instantly_statuts"] = "Blocked"
-
-        airtable_updates.append({"id": airtable_id, "fields": fields})
 
         if res.get("error"):
+            # Delete failed – keep instantly_lead_id so we can retry later.
             error_count += 1
             status.write(f"⚠️ {airtable_id}: cleanup error – {res['error']}")
         elif res["deleted"]:
+            # Successfully removed – clear Instantly references.
+            fields["instantly_lead_id"] = None
+            fields["instantly_campaign_id"] = None
             deleted_count += 1
             status.write(f"🗑️ {airtable_id}: removed from Instantly ({res['verification_status']})")
         else:
+            # Lead was not in Instantly – clear stale references if any.
+            fields["instantly_lead_id"] = None
+            fields["instantly_campaign_id"] = None
             not_found_count += 1
+
+        airtable_updates.append({"id": airtable_id, "fields": fields})
 
     # Batch update Airtable
     if airtable_updates:
