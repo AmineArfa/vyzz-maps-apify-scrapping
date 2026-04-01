@@ -11,10 +11,14 @@ import requests
 VALID_STATUSES = {"ok", "invalid", "catch_all", "unknown", "disposable"}
 
 # Statuses considered safe to sync to Instantly.
-GOOD_STATUSES = {"ok"}
+GOOD_STATUSES = {"ok", "catch_all"}
 
-# Everything else is blocked from Instantly.
-BAD_STATUSES = VALID_STATUSES - GOOD_STATUSES
+# Statuses where verification was inconclusive (API error, timeout, etc.).
+# These leads should be left alone — not synced, not deleted.
+SKIP_STATUSES = {"unknown"}
+
+# Only definitively bad emails get blocked/deleted from Instantly.
+BAD_STATUSES = VALID_STATUSES - GOOD_STATUSES - SKIP_STATUSES
 
 MILLIONVERIFIER_API_URL = "https://api.millionverifier.com/api/v3/"
 

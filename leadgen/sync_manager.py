@@ -18,7 +18,7 @@ from .instantly import (
     update_lead_in_instantly,
 )
 from .json_sanitize import sanitize_for_json
-from .millionverifier import GOOD_STATUSES, verify_pending_leads
+from .millionverifier import GOOD_STATUSES, SKIP_STATUSES, verify_pending_leads
 
 
 def _classify_error(err: str | None) -> str:
@@ -584,9 +584,10 @@ def sync_with_verification(
         on_progress=_on_verify_progress,
     )
 
-    # ── Step 2: Split good / bad ─────────────────────────────────────────
+    # ── Step 2: Split good / skip / bad ──────────────────────────────────
     good_leads: list[dict] = []
-    good_api_verified_ids: list[str] = []  # Airtable IDs needing verification_status='ok'
+    good_api_verified_ids: list[str] = []  # Airtable IDs needing verification_status persisted
+    skipped_leads: list[dict] = []  # unknown / inconclusive — leave alone
     bad_leads: list[tuple[dict, str]] = []  # (record, status)
 
     for rec, v_status, was_api in verified:
@@ -596,20 +597,27 @@ def sync_with_verification(
                 airtable_id = rec.get("id")
                 if airtable_id:
                     good_api_verified_ids.append(airtable_id)
+        elif v_status in SKIP_STATUSES:
+            skipped_leads.append(rec)
         else:
             bad_leads.append((rec, v_status))
 
     status.write(
-        f"📊 Verification results: {len(good_leads)} good (ok) / "
+        f"📊 Verification results: {len(good_leads)} good / "
+        f"{len(skipped_leads)} skipped (unknown) / "
         f"{len(bad_leads)} bad (blocked)"
     )
 
     # ── Step 3: Sync good leads ──────────────────────────────────────────
+    leads_to_sync = good_leads + skipped_leads
     sync_result: dict = {}
-    if good_leads:
-        status.write(f"🚀 Syncing {len(good_leads)} verified leads to Instantly...")
+    if leads_to_sync:
+        status.write(
+            f"🚀 Syncing {len(leads_to_sync)} leads to Instantly "
+            f"({len(good_leads)} verified + {len(skipped_leads)} unverified)..."
+        )
         sync_result = sync_pending_leads(
-            good_leads,
+            leads_to_sync,
             table_leads,
             secrets=secrets,
             debug_mode=debug_mode,
@@ -619,7 +627,7 @@ def sync_with_verification(
         if sync_result.get("error"):
             return sync_result  # propagate fatal Airtable error
     else:
-        status.write("ℹ️ No good leads to sync to Instantly.")
+        status.write("ℹ️ No leads to sync to Instantly.")
 
     # ── Step 4: Clean up bad leads ───────────────────────────────────────
     cleanup_result: dict = {}
@@ -669,6 +677,7 @@ def sync_with_verification(
         "count": sync_result.get("count", 0),
         "failures": sync_result.get("failures", 0),
         "skipped": skipped,
+        "verification_skipped": len(skipped_leads),
         "blocked": len(bad_leads),
         "blocked_deleted": cleanup_result.get("deleted", 0),
         "failure_counts": sync_result.get("failure_counts", {}),
