@@ -158,38 +158,29 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
                             return {"id": lead_id_airtable, "status": "Failed", "error": f"Update failed ({err}), Create also failed: {create_err}"}
             else:
                 # A1b: Email changed OR lead doesn't exist in Instantly anymore
-                # First, check if new email already exists in Instantly
-                existing_with_new_email, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
-                
-                if existing_with_new_email:
-                    # New email already exists -> Link to existing, delete old
-                    operation = "Link"
-                    new_instantly_id = existing_with_new_email.get("id")
-                    
-                    # Delete old lead if it still exists and is different
+                # Always try to add to campaign first (don't search — search is global).
+                operation = "Create"
+                cnt, created, _, create_err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
+                if cnt > 0 and created:
+                    new_instantly_id = created[0].get("id")
+                    # Create succeeded — safe to remove old lead now
                     if lead_exists_in_instantly and new_instantly_id != lead_id_instantly:
                         delete_lead_from_instantly(api_key, lead_id_instantly)
                 else:
-                    # New email doesn't exist -> Create new FIRST, then delete old
-                    operation = "Create"
-                    cnt, created, _, create_err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
-                    if cnt > 0 and created:
-                        new_instantly_id = created[0].get("id")
-                        # Create succeeded — safe to remove old lead now
+                    # Already in campaign or failed — search to get the ID
+                    existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+                    if existing:
+                        new_instantly_id = existing.get("id")
+                        operation = "Link"
                         if lead_exists_in_instantly and new_instantly_id != lead_id_instantly:
                             delete_lead_from_instantly(api_key, lead_id_instantly)
+                    elif create_err:
+                        # Both failed — keep existing lead untouched
+                        return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, create failed: {create_err}"}
                     else:
-                        # Double-check: maybe it was created by another thread/process
-                        existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
-                        if existing:
-                            new_instantly_id = existing.get("id")
-                            operation = "Link"
-                            # Clean up old lead since we linked to new one
-                            if lead_exists_in_instantly and new_instantly_id != lead_id_instantly:
-                                delete_lead_from_instantly(api_key, lead_id_instantly)
-                        else:
-                            # Both failed — keep existing lead untouched
-                            return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, create failed: {create_err}"}
+                        # Skipped (already in campaign) but search didn't find it
+                        new_instantly_id = lead_id_instantly
+                        operation = "Skip"
         else:
             # A2: No email -> DELETE from Instantly
             operation = "Delete"
@@ -203,37 +194,31 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
     # =========================================================================
     else:
         if has_email_mark and email:
-            # B1: Has email -> Check if it already exists in Instantly
-            existing_lead, search_err = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
-            
-            if existing_lead:
-                # B1a: Email already exists in Instantly -> Link to it
-                operation = "Link"
-                new_instantly_id = existing_lead.get("id")
-            else:
-                # B1b: Email doesn't exist -> Create new lead
-                operation = "Create"
-                cnt, created, _, err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
-                if cnt > 0 and created:
-                    new_instantly_id = created[0].get("id")
-                elif err:
-                    # Final check: maybe created by race condition
-                    existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
-                    if existing:
-                        new_instantly_id = existing.get("id")
-                        operation = "Link"
-                    else:
-                        return {"id": lead_id_airtable, "status": "Failed", "error": f"Create Failed: {err}"}
+            # B1: Has email -> Always try to add to campaign.
+            # skip_if_in_campaign=True handles dedup within the campaign.
+            # We do NOT search first, because the search API returns leads
+            # from ANY campaign, not just the target one.
+            operation = "Create"
+            cnt, created, _, err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
+            if cnt > 0 and created:
+                new_instantly_id = created[0].get("id")
+            elif err:
+                # Create failed — search as fallback (race condition / transient error)
+                existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+                if existing:
+                    new_instantly_id = existing.get("id")
+                    operation = "Link"
                 else:
-                    # cnt == 0 but no error - lead was skipped (already exists)
-                    # Search for it
-                    existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
-                    if existing:
-                        new_instantly_id = existing.get("id")
-                        operation = "Link"
-                    else:
-                        new_instantly_id = None
-                        operation = "Skip"
+                    return {"id": lead_id_airtable, "status": "Failed", "error": f"Create Failed: {err}"}
+            else:
+                # cnt == 0 but no error — lead already in this campaign (skipped)
+                existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
+                if existing:
+                    new_instantly_id = existing.get("id")
+                    operation = "Link"
+                else:
+                    new_instantly_id = None
+                    operation = "Skip"
         else:
             # B2: No email -> Nothing to sync
             new_instantly_id = None if lead_id_instantly else lead_id_instantly
