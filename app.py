@@ -245,11 +245,28 @@ def main():
                 f"{pending_count - MAX_SYNC_PER_RUN} will remain pending for the next refresh."
             )
         
-        col_header, col_btn = st.columns([3, 1])
+        # --- Industry filter for focused sync ---
+        available_industries = sorted(
+            pending_df["industry"].dropna().unique().tolist()
+        ) if "industry" in pending_df.columns and not pending_df.empty else []
+
+        col_header, col_filter = st.columns([2, 2])
         with col_header:
             st.subheader(f"⏳ Pending Updates: {pending_count} Leads")
-        
-        with col_btn:
+        with col_filter:
+            selected_industry = st.selectbox(
+                "Filter by industry",
+                options=["All Industries"] + available_industries,
+                key="sync_industry_filter",
+            )
+
+        if selected_industry != "All Industries":
+            pending_df = pending_df[pending_df["industry"] == selected_industry]
+            pending_count = len(pending_df)
+            st.info(f"Filtered to **{pending_count}** leads in **{selected_industry}**")
+
+        col_sync, _ = st.columns([1, 3])
+        with col_sync:
              # Sync Button (Active only if pending items exist)
              if st.button(f"🚀 Sync {pending_count} Updates", type="primary", disabled=pending_count == 0):
                  with st.status("Syncing to Instantly...", expanded=True) as status:
