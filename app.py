@@ -223,6 +223,14 @@ def main():
             syn = row["last_synced_at"]
             if pd.isna(mod): return False # Should not happen if Airtable tracks it
             if pd.isna(syn): return True # Never synced
+
+            # Recovery: leads wrongly blocked as catch_all/unknown need re-syncing.
+            # They have last_synced_at set but were never actually added to Instantly.
+            status = row.get("instantly_statuts")
+            v_status = row.get("verification_status", "")
+            if status == "Blocked" and str(v_status).strip().lower() in ("catch_all", "unknown", ""):
+                return True
+
             return mod > syn
 
         # Apply pending filter

@@ -136,21 +136,25 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
                 operation = "Update"
                 patch_payload = _build_patch_payload(clean_data)
                 success, err = update_lead_in_instantly(api_key, lead_id_instantly, patch_payload, debug=debug_mode)
-                
+
                 if not success:
-                    # PATCH failed - try delete + create as fallback
+                    # PATCH failed — try create FIRST, only delete old if create succeeds
                     operation = "Create"
-                    delete_lead_from_instantly(api_key, lead_id_instantly)
                     cnt, created, _, create_err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
                     if cnt > 0 and created:
+                        # Create succeeded — safe to remove the old one now
                         new_instantly_id = created[0].get("id")
+                        if new_instantly_id != lead_id_instantly:
+                            delete_lead_from_instantly(api_key, lead_id_instantly)
                     else:
-                        # Check if email now exists (race condition or duplicate)
+                        # Create failed — check if email exists (skip_if_in_campaign)
                         existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
                         if existing:
                             new_instantly_id = existing.get("id")
                             operation = "Link"
                         else:
+                            # Both failed — keep existing lead untouched
+                            operation = "Update"
                             return {"id": lead_id_airtable, "status": "Failed", "error": f"Update failed ({err}), Create also failed: {create_err}"}
             else:
                 # A1b: Email changed OR lead doesn't exist in Instantly anymore
@@ -166,21 +170,25 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
                     if lead_exists_in_instantly and new_instantly_id != lead_id_instantly:
                         delete_lead_from_instantly(api_key, lead_id_instantly)
                 else:
-                    # New email doesn't exist -> Delete old + Create new
+                    # New email doesn't exist -> Create new FIRST, then delete old
                     operation = "Create"
-                    if lead_exists_in_instantly:
-                        delete_lead_from_instantly(api_key, lead_id_instantly)
-                    
                     cnt, created, _, create_err = export_leads_to_instantly(api_key, c_id, [clean_data], debug=debug_mode)
                     if cnt > 0 and created:
                         new_instantly_id = created[0].get("id")
+                        # Create succeeded — safe to remove old lead now
+                        if lead_exists_in_instantly and new_instantly_id != lead_id_instantly:
+                            delete_lead_from_instantly(api_key, lead_id_instantly)
                     else:
                         # Double-check: maybe it was created by another thread/process
                         existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
                         if existing:
                             new_instantly_id = existing.get("id")
                             operation = "Link"
+                            # Clean up old lead since we linked to new one
+                            if lead_exists_in_instantly and new_instantly_id != lead_id_instantly:
+                                delete_lead_from_instantly(api_key, lead_id_instantly)
                         else:
+                            # Both failed — keep existing lead untouched
                             return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, create failed: {create_err}"}
         else:
             # A2: No email -> DELETE from Instantly
