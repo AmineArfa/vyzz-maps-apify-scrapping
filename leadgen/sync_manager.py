@@ -12,6 +12,7 @@ from .instantly import (
     export_leads_to_instantly,
     find_or_create_instantly_campaign,
     get_lead_from_instantly,
+    inject_lid_to_lead,
     is_valid_uuid,
     reset_campaign_cache,
     search_lead_by_email,
@@ -40,7 +41,7 @@ def _classify_error(err: str | None) -> str:
     return "other"
 
 
-def _build_patch_payload(clean_data: dict) -> dict:
+def _build_patch_payload(clean_data: dict, instantly_lead_id: str | None = None) -> dict:
     """Build a PATCH payload from clean_data."""
     raw_name = clean_data.get("key_contact_name", "")
     name_parts = str(raw_name).split(" ")
@@ -57,6 +58,9 @@ def _build_patch_payload(clean_data: dict) -> dict:
         "competitor2": clean_data.get("competitor2"),
         "competitor3": clean_data.get("competitor3"),
     }
+    # Preserve lid for closed-loop tracking ({{lid}} merge variable in email templates)
+    if instantly_lead_id:
+        custom_vars["lid"] = instantly_lead_id
     custom_vars = {k: v for k, v in custom_vars.items() if v not in (None, "", [], {})}
 
     return sanitize_for_json({
@@ -134,7 +138,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
             if lead_exists_in_instantly and email_matches:
                 # A1a: Lead exists and email matches -> PATCH update
                 operation = "Update"
-                patch_payload = _build_patch_payload(clean_data)
+                patch_payload = _build_patch_payload(clean_data, instantly_lead_id=lead_id_instantly)
                 success, err = update_lead_in_instantly(api_key, lead_id_instantly, patch_payload, debug=debug_mode)
 
                 if not success:
@@ -223,6 +227,11 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
             # B2: No email -> Nothing to sync
             new_instantly_id = None if lead_id_instantly else lead_id_instantly
             operation = "Skip"
+
+    # Inject lid into Instantly custom_variables for closed-loop tracking.
+    # Makes {{lid}} available as a merge variable in email templates.
+    if new_instantly_id and is_valid_uuid(new_instantly_id) and operation in ("Create", "Link"):
+        inject_lid_to_lead(api_key, new_instantly_id, debug=debug_mode)
 
     return {
         "id": lead_id_airtable,

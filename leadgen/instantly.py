@@ -295,7 +295,7 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             api_key,
             campaign_id,
             variables=["postalCode", "jobTitle", "address", "City", "state",
-                       "competitor1", "competitor2", "competitor3"],
+                       "competitor1", "competitor2", "competitor3", "lid"],
             debug=debug,
         )
 
@@ -498,6 +498,43 @@ def update_lead_in_instantly(api_key, lead_id, lead_data, debug=False):
         if debug:
             st.write(f"⚠️ {err}")
         return False, err
+
+
+def inject_lid_to_lead(api_key, lead_id, debug=False):
+    """
+    Inject the lead's own Instantly system ID as a 'lid' custom variable.
+    This makes {{lid}} available as a merge variable in email templates,
+    enabling closed-loop click tracking: email link → ?lid={{lid}} → audit → Airtable.
+
+    IMPORTANT: custom_variables REPLACES the entire object on update.
+    We must read existing variables first, merge, then write back.
+    """
+    if not api_key or not lead_id or not is_valid_uuid(lead_id):
+        return False, "Missing api_key or invalid lead_id"
+
+    # Step 1: Fetch current lead to get existing custom_variables
+    lead_data, err = get_lead_from_instantly(api_key, lead_id, debug=debug)
+    if not lead_data:
+        return False, f"Cannot fetch lead to inject lid: {err}"
+
+    # Step 2: Merge lid into existing payload (payload = custom_variables)
+    existing_vars = lead_data.get("payload") or {}
+    if existing_vars.get("lid") == lead_id:
+        # Already has correct lid — skip
+        if debug:
+            st.write(f"⏭️ Lead {lead_id} already has lid set, skipping.")
+        return True, None
+
+    merged_vars = {**existing_vars, "lid": lead_id}
+
+    # Step 3: Update lead with merged custom_variables
+    patch_payload = {"custom_variables": merged_vars}
+    success, update_err = update_lead_in_instantly(api_key, lead_id, patch_payload, debug=debug)
+    if success:
+        if debug:
+            st.write(f"✅ Injected lid={lead_id[:12]}... into lead custom_variables")
+        return True, None
+    return False, f"Failed to inject lid: {update_err}"
 
 
 def delete_lead_from_instantly(api_key, lead_id, debug=False):
