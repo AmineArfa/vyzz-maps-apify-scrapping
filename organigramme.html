@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lead Generation Engine - n8n Workflow</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1b1b2f;font-family:'Segoe UI',system-ui,sans-serif;color:#e0e0e0;overflow:auto}
+h1{text-align:center;padding:28px 20px 8px;font-size:26px;color:#ff6d5a;letter-spacing:1px}
+.sub{text-align:center;color:#7a7a9a;font-size:13px;margin-bottom:24px}
+.canvas{position:relative;width:2400px;margin:0 auto 80px;min-height:3300px}
+svg.conn{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:1}
+svg.conn path{fill:none;stroke-width:2.4;stroke-dasharray:8 4;animation:fd 1.5s linear infinite}
+svg.conn path.green{stroke:#5affb4}
+svg.conn path.purple{stroke:#a855f7}
+svg.conn path.red{stroke:#ff4757}
+svg.conn path.orange{stroke:#ff6d5a}
+svg.conn text{font-size:11px;font-weight:700;fill:#fff;pointer-events:none}
+svg.conn text.lbl-bg{font-size:11px;fill:#1b1b2f;stroke:#1b1b2f;stroke-width:4;paint-order:stroke}
+@keyframes fd{to{stroke-dashoffset:-24}}
+
+.node{position:absolute;background:#252547;border:2px solid #3a3a5c;border-radius:12px;min-width:160px;max-width:210px;z-index:10;transition:transform .2s,box-shadow .2s;box-shadow:0 4px 14px rgba(0,0,0,.3)}
+.node:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.nh{display:flex;align-items:center;gap:9px;padding:11px 13px;border-radius:10px 10px 0 0;font-weight:600;font-size:12.5px;letter-spacing:.3px}
+.ni{width:30px;height:30px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.nb{padding:8px 13px 12px;font-size:11px;color:#999;line-height:1.5;border-top:1px solid #3a3a5c}
+.nb .d{display:flex;gap:5px;margin-bottom:3px}
+.nb .di{font-size:9px;margin-top:2px;flex-shrink:0}
+
+.port{position:absolute;width:11px;height:11px;border-radius:50%;border:2px solid #252547;z-index:20}
+.po{right:-6px;top:50%;transform:translateY(-50%);background:#ff6d5a}
+.pi{left:-6px;top:50%;transform:translateY(-50%);background:#ff6d5a}
+.pb{bottom:-6px;left:50%;transform:translateX(-50%);background:#ff6d5a}
+.pt{top:-6px;left:50%;transform:translateX(-50%);background:#ff6d5a}
+
+/* Node types */
+.T .nh{background:linear-gradient(135deg,#4a1942,#6b2fa0)}.T .ni{background:#8b5cf6;color:#fff}.T{border-color:#8b5cf6}
+.S .nh{background:linear-gradient(135deg,#1a3a2e,#2a6040)}.S .ni{background:#10b981;color:#fff}.S{border-color:#10b981}
+.A .nh{background:linear-gradient(135deg,#3a2a1a,#6a4a2a)}.A .ni{background:#f59e0b;color:#fff}.A{border-color:#f59e0b}
+.E .nh{background:linear-gradient(135deg,#1a2a4a,#2a4a7a)}.E .ni{background:#3b82f6;color:#fff}.E{border-color:#3b82f6}
+.V .nh{background:linear-gradient(135deg,#2a1a3a,#5a3a7a)}.V .ni{background:#a855f7;color:#fff}.V{border-color:#a855f7}
+.X .nh{background:linear-gradient(135deg,#4a1a1a,#7a2a2a)}.X .ni{background:#ef4444;color:#fff}.X{border-color:#ef4444}
+.D .nh{background:linear-gradient(135deg,#1a3a4a,#2a5a6a)}.D .ni{background:#06b6d4;color:#fff}.D{border-color:#06b6d4}
+.L .nh{background:linear-gradient(135deg,#3a3a1a,#5a5a2a)}.L .ni{background:#eab308;color:#1b1b2f}.L{border-color:#eab308}
+.O .nh{background:linear-gradient(135deg,#1a4a2a,#2a7a4a)}.O .ni{background:#22c55e;color:#fff}.O{border-color:#22c55e}
+.W .nh{background:linear-gradient(135deg,#4a2a1a,#7a4a2a)}.W .ni{background:#f97316;color:#fff}.W{border-color:#f97316}
+
+/* IF diamond */
+.IF{border-radius:8px;background:#2a2a3e;border-width:2.5px}
+.IF .nh{border-radius:6px 6px 0 0}
+/* Switch */
+.SW{border-radius:8px;background:#2a2a3e;border-width:2.5px;border-color:#eab308}
+.SW .nh{border-radius:6px 6px 0 0;background:linear-gradient(135deg,#3a3a1a,#5a5a2a)}
+.SW .ni{background:#eab308;color:#1b1b2f}
+/* Merge */
+.M{border-radius:8px;background:#2a2a3e;min-width:100px;max-width:140px}
+.M .nh{border-radius:6px 6px 0 0;background:linear-gradient(135deg,#2a2a3a,#3a3a4a);padding:8px 10px;font-size:11px}
+.M .ni{width:24px;height:24px;font-size:13px;background:#666;color:#fff}
+
+.badge{position:absolute;top:-10px;right:-10px;background:#ff6d5a;color:#fff;font-size:9px;font-weight:700;padding:2px 7px;border-radius:10px;z-index:30;letter-spacing:.5px}
+
+.sec{position:absolute;z-index:5;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:2px;padding:5px 14px;border-radius:18px;background:rgba(255,255,255,.05);border:1px dashed rgba(255,255,255,.12);color:#555}
+.secbg{position:absolute;border-radius:14px;background:rgba(255,255,255,.012);border:1px solid rgba(255,255,255,.03);z-index:0}
+
+.legend{position:fixed;bottom:16px;right:16px;background:#252547;border:1px solid #3a3a5c;border-radius:12px;padding:14px;z-index:100;font-size:10.5px;box-shadow:0 4px 18px rgba(0,0,0,.4);max-height:90vh;overflow-y:auto}
+.legend h3{font-size:11px;margin-bottom:8px;color:#ff6d5a}
+.li{display:flex;align-items:center;gap:7px;margin-bottom:5px;color:#999}
+.ld{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+</style>
+</head>
+<body>
+<h1>Lead Generation Engine</h1>
+<p class="sub">n8n-style Workflow &mdash; Every branch is an explicit node</p>
+
+<div class="canvas" id="canvas">
+
+<!-- SECTION BGs -->
+<div class="secbg" style="left:30px;top:5px;width:2340px;height:180px"></div>
+<div class="secbg" style="left:30px;top:205px;width:2340px;height:240px"></div>
+<div class="secbg" style="left:30px;top:465px;width:2340px;height:180px"></div>
+<div class="secbg" style="left:30px;top:665px;width:2340px;height:180px"></div>
+<div class="secbg" style="left:30px;top:865px;width:2340px;height:250px"></div>
+<div class="secbg" style="left:30px;top:1135px;width:2340px;height:250px"></div>
+<div class="secbg" style="left:30px;top:1405px;width:2340px;height:180px"></div>
+<div class="secbg" style="left:30px;top:1620px;width:2340px;height:940px"></div>
+
+<!-- SECTION LABELS -->
+<div class="sec" style="left:50px;top:12px">1. Trigger &amp; Setup</div>
+<div class="sec" style="left:50px;top:212px">2. Zone Strategy</div>
+<div class="sec" style="left:50px;top:472px">3. Scraping</div>
+<div class="sec" style="left:50px;top:672px">4. Processing</div>
+<div class="sec" style="left:50px;top:872px">5. Enrichment</div>
+<div class="sec" style="left:50px;top:1142px">6. Export &amp; Store</div>
+<div class="sec" style="left:50px;top:1412px">7. Finish &amp; Log</div>
+<div class="sec" style="left:50px;top:1627px">8. Sync Manager (Tab 2)</div>
+
+<!-- ===================== ROW 1: TRIGGER ===================== -->
+<div class="node T" id="trigger" style="left:80px;top:55px">
+  <div class="nh"><div class="ni">&#9889;</div><span>User Trigger</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9654;</span> Click "Find &amp; Sync"</div><div class="d"><span class="di">&#128196;</span> Streamlit app.py</div></div>
+  <div class="port po"></div>
+</div>
+<div class="node T" id="config" style="left:340px;top:40px">
+  <div class="nh"><div class="ni">&#9881;</div><span>Config Input</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128188;</span> Industry</div><div class="d"><span class="di">&#128269;</span> Search Query</div><div class="d"><span class="di">&#127961;</span> City</div><div class="d"><span class="di">&#128202;</span> Max Leads</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node W" id="credits-pre" style="left:620px;top:50px">
+  <div class="nh"><div class="ni">&#128176;</div><span>Credit Snapshot</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128200;</span> Apify $ (pre)</div><div class="d"><span class="di">&#128200;</span> Apollo credits</div><div class="d"><span class="di">&#128200;</span> Instantly plan</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node D" id="fetch-existing" style="left:900px;top:45px">
+  <div class="nh"><div class="ni">&#128451;</div><span>Fetch Existing</span></div>
+  <div class="nb"><div class="d"><span class="di">&#127380;</span> Airtable leads</div><div class="d"><span class="di">&#128279;</span> Websites set</div><div class="d"><span class="di">&#128222;</span> Phones set</div><div class="d"><span class="di">&#128203;</span> Writable fields</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- ===================== ROW 2: ZONE STRATEGY ===================== -->
+<div class="node IF L" id="if-split" style="left:200px;top:270px">
+  <div class="nh"><div class="ni">&#9670;</div><span>IF Gemini Split?</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9745;</span> Toggle + API key</div></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+<div class="node A" id="gemini" style="left:500px;top:240px">
+  <div class="nh"><div class="ni">&#129302;</div><span>Gemini AI</span></div>
+  <div class="nb"><div class="d"><span class="di">&#127758;</span> Generate 10 zones</div><div class="d"><span class="di">&#128190;</span> 14-day cache</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node L" id="zone-loop" style="left:780px;top:240px">
+  <div class="nh"><div class="ni">&#128260;</div><span>Zone Loop</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9654;</span> For each zone</div><div class="d"><span class="di">&#9989;</span> Early stop at max</div></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+<div class="node W" id="zone-dash" style="left:1080px;top:245px">
+  <div class="nh"><div class="ni">&#128202;</div><span>Zone Dashboard</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128200;</span> Live status table</div></div>
+  <div class="port pi"></div>
+</div>
+<div class="node L" id="single-query" style="left:500px;top:370px">
+  <div class="nh"><div class="ni">&#128203;</div><span>Single Query</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128269;</span> No zone split</div><div class="d"><span class="di">&#127758;</span> Full location query</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node M" id="merge-zone" style="left:820px;top:375px">
+  <div class="nh"><div class="ni">&#128257;</div><span>Merge</span></div>
+  <div class="port pi"></div><div class="port pb"></div>
+</div>
+
+<!-- ===================== ROW 3: SCRAPING ===================== -->
+<div class="node S" id="apify" style="left:280px;top:510px">
+  <div class="nh"><div class="ni">&#128375;</div><span>Apify Scraper</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128506;</span> Google Maps crawler</div><div class="d"><span class="di">&#128200;</span> 50+ fields/place</div><div class="d"><span class="di">&#128176;</span> ~$0.02/place</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node L" id="raw-data" style="left:580px;top:515px">
+  <div class="nh"><div class="ni">&#128230;</div><span>Raw Place Data</span></div>
+  <div class="nb"><div class="d"><span class="di">&#127970;</span> Title, Phone, Website</div><div class="d"><span class="di">&#128205;</span> PlaceId, Rating</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- ===================== ROW 4: PROCESSING ===================== -->
+<div class="node L" id="dedup" style="left:120px;top:710px">
+  <div class="nh"><div class="ni">&#128269;</div><span>Deduplication</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128279;</span> By website/phone/placeId</div><div class="d"><span class="di">&#128451;</span> vs Airtable existing</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node L" id="parser" style="left:400px;top:710px">
+  <div class="nh"><div class="ni">&#128295;</div><span>Address Parser</span></div>
+  <div class="nb"><div class="d"><span class="di">&#127961;</span> City, state, zip</div><div class="d"><span class="di">&#127975;</span> NYC borough fix</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node L" id="filter" style="left:680px;top:710px">
+  <div class="nh"><div class="ni">&#128295;</div><span>Field Filter</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9989;</span> Writable fields only</div><div class="d"><span class="di">&#10060;</span> Drop computed</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node L" id="sanitize" style="left:950px;top:715px">
+  <div class="nh"><div class="ni">&#128203;</div><span>JSON Sanitize</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128203;</span> NaN/Inf to null</div><div class="d"><span class="di">&#128203;</span> Safe API payloads</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- ===================== ROW 5: ENRICHMENT ===================== -->
+<div class="node IF L" id="if-enrich" style="left:150px;top:930px">
+  <div class="nh"><div class="ni">&#9670;</div><span>IF Enrich Emails?</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9745;</span> User toggle</div></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+<div class="node E" id="apollo-search" style="left:460px;top:900px">
+  <div class="badge">5 THREADS</div>
+  <div class="nh"><div class="ni">&#128640;</div><span>Apollo: Search</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128269;</span> People at domain</div><div class="d"><span class="di">&#128100;</span> CEO/Owner/Founder</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node E" id="apollo-match" style="left:740px;top:900px">
+  <div class="nh"><div class="ni">&#128274;</div><span>Apollo: Match</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9993;</span> Reveal email</div><div class="d"><span class="di">&#128100;</span> Name + Position</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node L" id="skip-enrich" style="left:460px;top:1030px">
+  <div class="nh"><div class="ni">&#10145;</div><span>Skip Enrichment</span></div>
+  <div class="nb"><div class="d"><span class="di">&#10060;</span> No contact data</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node M" id="merge-enrich" style="left:1020px;top:950px">
+  <div class="nh"><div class="ni">&#128257;</div><span>Merge</span></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- ===================== ROW 6: EXPORT & STORE ===================== -->
+<div class="node IF L" id="if-campaign" style="left:150px;top:1200px">
+  <div class="nh"><div class="ni">&#9670;</div><span>IF Has Campaign?</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128273;</span> campaign_id exists</div></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+<div class="node X" id="instantly-export" style="left:460px;top:1170px">
+  <div class="nh"><div class="ni">&#9993;</div><span>Instantly Export</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128232;</span> Create leads</div><div class="d"><span class="di">&#128203;</span> Custom variables</div><div class="d"><span class="di">&#128260;</span> 429 backoff</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node L" id="skip-instantly" style="left:460px;top:1300px">
+  <div class="nh"><div class="ni">&#10145;</div><span>Skip Instantly</span></div>
+  <div class="nb"><div class="d"><span class="di">&#10060;</span> No campaign</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node M" id="merge-export" style="left:740px;top:1230px">
+  <div class="nh"><div class="ni">&#128257;</div><span>Merge</span></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node D" id="airtable-save" style="left:920px;top:1190px">
+  <div class="nh"><div class="ni">&#128451;</div><span>Airtable Batch Create</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128203;</span> Leads table</div><div class="d"><span class="di">&#128338;</span> last_modified_at</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- ===================== ROW 7: LOG & RESULTS ===================== -->
+<div class="node D" id="log-tx" style="left:300px;top:1450px">
+  <div class="nh"><div class="ni">&#128203;</div><span>Transaction Log</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128200;</span> Credits used</div><div class="d"><span class="di">&#128202;</span> Scraped/Added</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node W" id="credits-post" style="left:580px;top:1450px">
+  <div class="nh"><div class="ni">&#128176;</div><span>Credit Snapshot Post</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128200;</span> Apify $ (post)</div><div class="d"><span class="di">&#128202;</span> Delta calculation</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node O" id="results" style="left:880px;top:1450px">
+  <div class="nh"><div class="ni">&#9989;</div><span>Results Display</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128202;</span> Metrics + table</div><div class="d"><span class="di">&#128176;</span> Credit summary</div></div>
+  <div class="port pi"></div>
+</div>
+
+<!-- =========== SYNC MANAGER (TAB 2) =========== -->
+<div class="node T" id="sync-trigger" style="left:80px;top:1680px">
+  <div class="nh"><div class="ni">&#128260;</div><span>Sync Trigger</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9654;</span> Tab 2: Lead Manager</div><div class="d"><span class="di">&#128269;</span> Industry filter</div></div>
+  <div class="port po"></div>
+</div>
+<div class="node D" id="fetch-pending" style="left:350px;top:1675px">
+  <div class="nh"><div class="ni">&#128451;</div><span>Fetch Pending</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128338;</span> modified &gt; synced</div><div class="d"><span class="di">&#128203;</span> Or never synced</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<div class="node IF L" id="if-mv" style="left:640px;top:1685px">
+  <div class="nh"><div class="ni">&#9670;</div><span>IF MV Key?</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128273;</span> MillionVerifier key</div></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+
+<!-- YES: Verification path -->
+<div class="node V" id="mv-verify" style="left:920px;top:1660px">
+  <div class="badge">15 THREADS</div>
+  <div class="nh"><div class="ni">&#128274;</div><span>MillionVerifier</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128232;</span> Batch email check</div><div class="d"><span class="di">&#128203;</span> Returns status</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- Switch on MV result -->
+<div class="node SW" id="sw-mv" style="left:1200px;top:1660px">
+  <div class="nh"><div class="ni">&#9670;</div><span>Switch: MV Result</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128203;</span> 3 output branches</div></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+
+<!-- NO: Direct sync -->
+<div class="node L" id="direct-sync" style="left:920px;top:1790px">
+  <div class="nh"><div class="ni">&#10145;</div><span>Direct Sync</span></div>
+  <div class="nb"><div class="d"><span class="di">&#10060;</span> Skip verification</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- MV ok/catch_all branch -->
+<div class="node O" id="mv-ok" style="left:1500px;top:1640px">
+  <div class="nh"><div class="ni">&#9989;</div><span>Valid Email</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9989;</span> ok / catch_all</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- MV invalid/disposable branch -->
+<div class="node X" id="mv-invalid" style="left:1500px;top:1740px">
+  <div class="nh"><div class="ni">&#10060;</div><span>Invalid Email</span></div>
+  <div class="nb"><div class="d"><span class="di">&#10060;</span> invalid / disposable</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- MV unknown branch -->
+<div class="node L" id="mv-unknown" style="left:1500px;top:1830px">
+  <div class="nh"><div class="ni">&#10068;</div><span>Unknown Email</span></div>
+  <div class="nb"><div class="d"><span class="di">&#10068;</span> unknown status</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- Invalid -> Delete from Instantly -->
+<div class="node X" id="delete-instantly" style="left:1780px;top:1740px">
+  <div class="nh"><div class="ni">&#128465;</div><span>Delete Lead</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128465;</span> Remove from Instantly</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node D" id="mark-blocked" style="left:2050px;top:1740px">
+  <div class="nh"><div class="ni">&#128721;</div><span>Mark Blocked</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128203;</span> Airtable: Blocked</div></div>
+  <div class="port pi"></div>
+</div>
+
+<!-- Unknown -> Skip -->
+<div class="node L" id="skip-unknown" style="left:1780px;top:1830px">
+  <div class="nh"><div class="ni">&#10145;</div><span>Skip (No Action)</span></div>
+  <div class="nb"><div class="d"><span class="di">&#10145;</span> Leave as-is</div></div>
+  <div class="port pi"></div>
+</div>
+
+<!-- ===== SYNC LOGIC FOR VALID EMAILS ===== -->
+<!-- Switch on lead state -->
+<div class="node SW" id="sw-sync" style="left:300px;top:1960px">
+  <div class="nh"><div class="ni">&#9670;</div><span>Switch: Lead State</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128203;</span> 4 output branches</div></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+
+<!-- Branch 1: New + has email -->
+<div class="node E" id="search-email" style="left:600px;top:1930px">
+  <div class="nh"><div class="ni">&#128269;</div><span>Search by Email</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128269;</span> In Instantly</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node IF L" id="if-found" style="left:870px;top:1935px">
+  <div class="nh"><div class="ni">&#9670;</div><span>IF Found?</span></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+<div class="node D" id="link-existing" style="left:1120px;top:1910px">
+  <div class="nh"><div class="ni">&#128279;</div><span>Link Existing ID</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128279;</span> Reuse Instantly ID</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node X" id="create-new" style="left:1120px;top:2000px">
+  <div class="nh"><div class="ni">&#10133;</div><span>Create New Lead</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128232;</span> Add to Instantly</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- Branch 2: Existing + same email -->
+<div class="node X" id="patch-update" style="left:600px;top:2090px">
+  <div class="nh"><div class="ni">&#128221;</div><span>PATCH Update</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128221;</span> Update in Instantly</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node IF L" id="if-patch-ok" style="left:870px;top:2095px">
+  <div class="nh"><div class="ni">&#9670;</div><span>IF PATCH OK?</span></div>
+  <div class="port pi"></div><div class="port po"></div><div class="port pb"></div>
+</div>
+<div class="node O" id="patch-done" style="left:1120px;top:2070px">
+  <div class="nh"><div class="ni">&#9989;</div><span>Update Done</span></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node X" id="delete-recreate" style="left:1120px;top:2155px">
+  <div class="nh"><div class="ni">&#128260;</div><span>Delete + Recreate</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128465;</span> Delete old</div><div class="d"><span class="di">&#10133;</span> Create new</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- Branch 3: Existing + email changed -->
+<div class="node X" id="delete-old" style="left:600px;top:2240px">
+  <div class="nh"><div class="ni">&#128465;</div><span>Delete Old Lead</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128465;</span> Remove from Instantly</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node X" id="create-changed" style="left:870px;top:2240px">
+  <div class="nh"><div class="ni">&#10133;</div><span>Create w/ New Email</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128232;</span> New email in Instantly</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- Branch 4: No email -->
+<div class="node L" id="skip-no-email" style="left:600px;top:2340px">
+  <div class="nh"><div class="ni">&#10145;</div><span>Skip (No Email)</span></div>
+  <div class="nb"><div class="d"><span class="di">&#10060;</span> No email to sync</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+
+<!-- FINAL MERGE -->
+<div class="node M" id="merge-sync" style="left:1400px;top:2150px">
+  <div class="nh"><div class="ni">&#128257;</div><span>Merge All</span></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node D" id="airtable-update" style="left:1580px;top:2110px">
+  <div class="nh"><div class="ni">&#128451;</div><span>Airtable Update</span></div>
+  <div class="nb"><div class="d"><span class="di">&#128338;</span> last_synced_at</div><div class="d"><span class="di">&#128203;</span> instantly_statuts</div><div class="d"><span class="di">&#128274;</span> verification_status</div><div class="d"><span class="di">&#128203;</span> instantly_lead_id</div></div>
+  <div class="port pi"></div><div class="port po"></div>
+</div>
+<div class="node O" id="sync-report" style="left:1880px;top:2120px">
+  <div class="nh"><div class="ni">&#128203;</div><span>Sync Report</span></div>
+  <div class="nb"><div class="d"><span class="di">&#9989;</span> N success / M fail</div><div class="d"><span class="di">&#128274;</span> X blocked</div><div class="d"><span class="di">&#128203;</span> Per-lead detail log</div></div>
+  <div class="port pi"></div>
+</div>
+
+<!-- SVG -->
+<svg class="conn" id="svg"></svg>
+</div>
+
+<!-- LEGEND -->
+<div class="legend">
+  <h3>Node Types</h3>
+  <div class="li"><div class="ld" style="background:#8b5cf6"></div> Trigger</div>
+  <div class="li"><div class="ld" style="background:#10b981"></div> Scraper</div>
+  <div class="li"><div class="ld" style="background:#f59e0b"></div> AI (Gemini)</div>
+  <div class="li"><div class="ld" style="background:#3b82f6"></div> Enrichment</div>
+  <div class="li"><div class="ld" style="background:#a855f7"></div> Verification</div>
+  <div class="li"><div class="ld" style="background:#ef4444"></div> Export/Action</div>
+  <div class="li"><div class="ld" style="background:#06b6d4"></div> Storage</div>
+  <div class="li"><div class="ld" style="background:#eab308"></div> Logic/IF/Switch</div>
+  <div class="li"><div class="ld" style="background:#22c55e"></div> Output</div>
+  <div class="li"><div class="ld" style="background:#f97316"></div> Dashboard</div>
+  <div style="margin-top:6px;border-top:1px solid #3a3a5c;padding-top:6px">
+    <div class="li"><svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="#ff6d5a" stroke-width="2" stroke-dasharray="5 3"/></svg> Main</div>
+    <div class="li"><svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="#5affb4" stroke-width="2" stroke-dasharray="5 3"/></svg> Secondary</div>
+    <div class="li"><svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="#a855f7" stroke-width="2" stroke-dasharray="5 3"/></svg> Sync</div>
+    <div class="li"><svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="#ff4757" stroke-width="2" stroke-dasharray="5 3"/></svg> Delete</div>
+  </div>
+  <div style="margin-top:6px;border-top:1px solid #3a3a5c;padding-top:6px">
+    <div class="li">&#9670; IF = Conditional branch</div>
+    <div class="li">&#9670; SW = Multi-output switch</div>
+    <div class="li">&#128257; = Merge node</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var NS = 'http://www.w3.org/2000/svg';
+  function el(tag){return document.createElementNS(NS,tag)}
+  function rect(id){
+    var n=document.getElementById(id);
+    if(!n)return null;
+    var r=n.getBoundingClientRect(),c=document.getElementById('canvas').getBoundingClientRect();
+    return{x:r.left-c.left+r.width/2,y:r.top-c.top+r.height/2,t:r.top-c.top,b:r.top-c.top+r.height,l:r.left-c.left,r:r.left-c.left+r.width};
+  }
+
+  // Connection definitions: [from, to, color, type, label]
+  // type: h=horizontal, v=vertical, hv=horizontal then vertical
+  var C=[
+    // Row 1
+    ['trigger','config','orange','h',''],
+    ['config','credits-pre','orange','h',''],
+    ['credits-pre','fetch-existing','orange','h',''],
+    ['fetch-existing','if-split','orange','v',''],
+
+    // Row 2: IF split
+    ['if-split','gemini','orange','h','YES'],
+    ['if-split','single-query','orange','v','NO'],
+    ['gemini','zone-loop','orange','h',''],
+    ['zone-loop','zone-dash','green','h',''],
+    ['zone-loop','apify','orange','v',''],
+    ['single-query','merge-zone','orange','h',''],
+    ['merge-zone','apify','orange','v',''],
+
+    // Row 3
+    ['apify','raw-data','orange','h',''],
+    ['raw-data','dedup','orange','v',''],
+
+    // Row 4
+    ['dedup','parser','orange','h',''],
+    ['parser','filter','orange','h',''],
+    ['filter','sanitize','orange','h',''],
+    ['sanitize','if-enrich','orange','v',''],
+
+    // Row 5: IF enrich
+    ['if-enrich','apollo-search','orange','h','YES'],
+    ['if-enrich','skip-enrich','orange','v','NO'],
+    ['apollo-search','apollo-match','orange','h',''],
+    ['apollo-match','merge-enrich','orange','h',''],
+    ['skip-enrich','merge-enrich','orange','h',''],
+    ['merge-enrich','if-campaign','orange','v',''],
+
+    // Row 6: IF campaign
+    ['if-campaign','instantly-export','orange','h','YES'],
+    ['if-campaign','skip-instantly','orange','v','NO'],
+    ['instantly-export','merge-export','orange','h',''],
+    ['skip-instantly','merge-export','orange','h',''],
+    ['merge-export','airtable-save','orange','h',''],
+    ['airtable-save','log-tx','orange','v',''],
+
+    // Row 7
+    ['log-tx','credits-post','orange','h',''],
+    ['credits-post','results','orange','h',''],
+
+    // ===== SYNC MANAGER =====
+    ['sync-trigger','fetch-pending','purple','h',''],
+    ['fetch-pending','if-mv','purple','h',''],
+
+    // IF MV key
+    ['if-mv','mv-verify','purple','h','YES'],
+    ['if-mv','direct-sync','purple','v','NO'],
+    ['mv-verify','sw-mv','purple','h',''],
+
+    // Switch MV result
+    ['sw-mv','mv-ok','purple','h','ok / catch_all'],
+    ['sw-mv','mv-invalid','purple','v','invalid'],
+    ['sw-mv','mv-unknown','purple','v','unknown'],
+
+    // Invalid path
+    ['mv-invalid','delete-instantly','red','h',''],
+    ['delete-instantly','mark-blocked','red','h',''],
+
+    // Unknown path
+    ['mv-unknown','skip-unknown','orange','h',''],
+
+    // Valid -> sync switch (and direct-sync merges here too)
+    ['mv-ok','sw-sync','purple','v',''],
+    ['direct-sync','sw-sync','purple','v',''],
+
+    // Switch sync: 4 branches
+    ['sw-sync','search-email','purple','h','New + Email'],
+    ['sw-sync','patch-update','purple','v','Existing'],
+    ['sw-sync','delete-old','purple','v','Email Changed'],
+    ['sw-sync','skip-no-email','purple','v','No Email'],
+
+    // Branch 1: Search email
+    ['search-email','if-found','purple','h',''],
+    ['if-found','link-existing','purple','h','YES'],
+    ['if-found','create-new','purple','v','NO'],
+    ['link-existing','merge-sync','purple','h',''],
+    ['create-new','merge-sync','purple','h',''],
+
+    // Branch 2: PATCH
+    ['patch-update','if-patch-ok','purple','h',''],
+    ['if-patch-ok','patch-done','purple','h','YES'],
+    ['if-patch-ok','delete-recreate','purple','v','NO'],
+    ['patch-done','merge-sync','purple','h',''],
+    ['delete-recreate','merge-sync','purple','h',''],
+
+    // Branch 3: Email changed
+    ['delete-old','create-changed','purple','h',''],
+    ['create-changed','merge-sync','purple','h',''],
+
+    // Branch 4: No email
+    ['skip-no-email','merge-sync','purple','h',''],
+
+    // Final merge
+    ['merge-sync','airtable-update','purple','h',''],
+    ['airtable-update','sync-report','purple','h','']
+  ];
+
+  function draw(){
+    var svg=document.getElementById('svg');
+    while(svg.firstChild)svg.removeChild(svg.firstChild);
+    var cv=document.getElementById('canvas');
+    svg.setAttribute('width',String(cv.offsetWidth));
+    svg.setAttribute('height',String(cv.offsetHeight));
+
+    for(var i=0;i<C.length;i++){
+      var c=C[i],f=rect(c[0]),t=rect(c[1]);
+      if(!f||!t)continue;
+      var col=c[2],tp=c[3],lbl=c[4];
+      var colors={orange:'#ff6d5a',green:'#5affb4',purple:'#a855f7',red:'#ff4757'};
+      var stroke=colors[col]||'#ff6d5a';
+
+      var x1,y1,x2,y2;
+      if(tp==='v'){
+        x1=f.x;y1=f.b;x2=t.x;y2=t.t;
+      } else {
+        x1=f.r;y1=f.y;x2=t.l;y2=t.y;
+      }
+
+      var dx=x2-x1,dy=y2-y1,d;
+      if(tp==='v'){
+        var cy=dy*0.45;
+        d='M '+x1+' '+y1+' C '+x1+' '+(y1+cy)+', '+x2+' '+(y2-cy)+', '+x2+' '+y2;
+      } else {
+        var cx=dx*0.4;
+        d='M '+x1+' '+y1+' C '+(x1+cx)+' '+y1+', '+(x2-cx)+' '+y2+', '+x2+' '+y2;
+      }
+
+      var p=el('path');
+      p.setAttribute('d',d);
+      p.setAttribute('stroke',stroke);
+      if(col==='green')p.setAttribute('class','green');
+      else if(col==='purple')p.setAttribute('class','purple');
+      else if(col==='red')p.setAttribute('class','red');
+      else p.setAttribute('class','orange');
+      svg.appendChild(p);
+
+      // End dot
+      var dot=el('circle');
+      dot.setAttribute('cx',String(x2));
+      dot.setAttribute('cy',String(y2));
+      dot.setAttribute('r','3.5');
+      dot.setAttribute('fill',stroke);
+      svg.appendChild(dot);
+
+      // Label
+      if(lbl){
+        var lx=(x1+x2)/2, ly=(y1+y2)/2;
+        if(tp==='v'){lx=Math.max(x1,x2)+8;ly=(y1+y2)/2;}
+        else{ly=Math.min(y1,y2)-8;}
+
+        // Background text (stroke trick for readability)
+        var bg=el('text');
+        bg.setAttribute('x',String(lx));
+        bg.setAttribute('y',String(ly));
+        bg.setAttribute('class','lbl-bg');
+        bg.setAttribute('text-anchor','middle');
+        bg.textContent=lbl;
+        svg.appendChild(bg);
+
+        // Foreground text
+        var tx=el('text');
+        tx.setAttribute('x',String(lx));
+        tx.setAttribute('y',String(ly));
+        tx.setAttribute('text-anchor','middle');
+        tx.setAttribute('fill','#fff');
+        tx.textContent=lbl;
+        svg.appendChild(tx);
+      }
+    }
+  }
+
+  window.addEventListener('load',function(){setTimeout(draw,200)});
+  window.addEventListener('resize',draw);
+})();
+</script>
+</body>
+</html>
