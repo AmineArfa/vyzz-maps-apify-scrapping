@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 
-from .airtable_utils import fetch_existing_leads, filter_airtable_fields, get_airtable_writable_field_names
 from .apollo import enrich_apollo
 from .apify_scraper import scrape_apify
 from .credits import get_apify_credits
@@ -15,7 +14,7 @@ from .parsing import parse_address_components
 
 def execute_with_credit_tracking(
     secrets,
-    table_leads,
+    backend,
     industry,
     city_input,
     max_leads,
@@ -46,14 +45,11 @@ def execute_with_credit_tracking(
     }
 
     try:
-        # Only allow fields that Airtable metadata reports as writable.
-        # If metadata lookup fails, we still proceed but rely on safe defaults (we omit known computed fields).
-        allowed_leads_fields = get_airtable_writable_field_names(
-            secrets["airtable_key"], secrets["airtable_base"], leads_table_id
-        )
+        # Only allow fields that the backend reports as writable.
+        allowed_leads_fields = backend.get_writable_field_names(leads_table_id)
 
         def set_if_allowed(record: dict, field_name: str, value):
-            """Set a field only if the Airtable schema contains it (or schema lookup failed)."""
+            """Set a field only if the backend schema contains it (or schema lookup failed)."""
             if value is None:
                 return
             if allowed_leads_fields and field_name not in allowed_leads_fields:
@@ -61,7 +57,7 @@ def execute_with_credit_tracking(
             record[field_name] = value
 
         dashboard.update_status("Fetching existing leads for deduplication...", 10)
-        exist_webs, exist_phones = fetch_existing_leads(table_leads)
+        exist_webs, exist_phones = backend.fetch_existing_leads()
 
         # Prepare zones for batch loop
         # Optional: Gemini-based location splitting (10 zones). Fallback is single query on ANY error/invalid output.
@@ -324,40 +320,16 @@ def execute_with_credit_tracking(
                                            set_if_allowed(valid_leads_instantly[c_idx], "instantly_lead_id", created.get("id"))
                                  except: pass
 
-             # 5. AIRTABLE SYNC (Intermediate Save)
-             dashboard.update_status(f"Batch {i+1}: Syncing {len(processed_batch)} to Airtable...", 90)
+             # 5. SAVE TO BACKEND (Intermediate Save)
+             dashboard.update_status(f"Batch {i+1}: Saving {len(processed_batch)} leads...", 90)
              try:
                   if processed_batch:
-                       table_leads.batch_create(processed_batch, typecast=True)
+                       backend.batch_create(processed_batch, scrapping_tool_id, industry, city_input)
                        current_zone_stats["synced"] = len(processed_batch)
              except Exception as e:
-                  # Retry logic for computed fields
-                  err_str = str(e)
-                  dropped_field = None
-                  if "INVALID_VALUE_FOR_COLUMN" in err_str and 'Field "' in err_str:
-                       try:
-                            dropped_field = err_str.split('Field "', 1)[1].split('"', 1)[0]
-                       except: dropped_field = None
-                  
-                  if dropped_field:
-                       cleaned = []
-                       for r in processed_batch:
-                            if isinstance(r, dict) and dropped_field in r:
-                                 r = dict(r)
-                                 r.pop(dropped_field, None)
-                            cleaned.append(r)
-                       try:
-                            table_leads.batch_create(cleaned, typecast=True)
-                            current_zone_stats["synced"] = len(cleaned)
-                            processed_batch = cleaned # keep cleaned for history
-                       except Exception as e2:
-                            msg = f"Batch {i} Sync Failed: {e2}"
-                            dashboard.log(msg, level="error")
-                            result_data["error_msg"] += f" | {msg}"
-                  else:
-                       msg = f"Batch {i} Sync Failed: {e}"
-                       dashboard.log(msg, level="error")
-                       result_data["error_msg"] += f" | {msg}"
+                  msg = f"Batch {i} Save Failed: {e}"
+                  dashboard.log(msg, level="error")
+                  result_data["error_msg"] += f" | {msg}"
 
              # Batch Complete
              collected_unique_leads.extend(processed_batch)
