@@ -1,13 +1,7 @@
 import pandas as pd
 import streamlit as st
 
-from leadgen.airtable_utils import (
-    get_industry_options,
-    init_airtable,
-    log_transaction,
-    fetch_all_leads,
-    batch_update_leads,
-)
+from leadgen.backend import AirtableBackend
 from leadgen.config import get_secrets
 from leadgen.credits import display_credit_dashboard
 from leadgen.dashboard import StatusDashboard
@@ -25,20 +19,64 @@ MAX_SYNC_PER_RUN = 5000
 st.set_page_config(page_title="Lead Generation Engine", page_icon="🚀", layout="wide")
 
 
+def _init_backend(secrets: dict, mode: str):
+    """Initialize the selected backend. Returns a DataBackend instance."""
+    if mode == "supabase":
+        from leadgen.supabase_utils import SupabaseBackend
+        return SupabaseBackend(secrets)
+    else:
+        return AirtableBackend(secrets, AIRTABLE_LEADS_TABLE, AIRTABLE_LOG_TABLE)
+
+
 def main():
     secrets = get_secrets()
 
+    # ── Backend toggle (Step 3.3) ──
+    config_default = secrets.get("data_backend", "airtable")
+    supabase_available = bool(secrets.get("supabase_db_url"))
+
+    st.sidebar.header("⚙️ Data Backend")
+    backend_options = ["airtable", "supabase"]
+    default_index = backend_options.index(config_default) if config_default in backend_options else 0
+
+    active_mode = st.sidebar.radio(
+        "Storage backend",
+        options=backend_options,
+        index=default_index,
+        format_func=lambda x: "Airtable (Legacy)" if x == "airtable" else "Supabase",
+        disabled=False,
+        key="backend_mode",
+        help="Switch between Airtable and Supabase for lead storage.",
+    )
+
+    # Prevent Supabase if credentials missing
+    if active_mode == "supabase" and not supabase_available:
+        st.sidebar.error("Supabase credentials not configured. Falling back to Airtable.")
+        active_mode = "airtable"
+
+    # Visual indicator
+    if active_mode == "supabase":
+        st.sidebar.success("🟢 **SUPABASE MODE**")
+    else:
+        st.sidebar.warning("🟠 **AIRTABLE MODE (Legacy)**")
+
+    if active_mode != config_default:
+        st.sidebar.caption(f"⚠️ Override — config default is **{config_default}**")
+    else:
+        st.sidebar.caption("(config default)")
+
+    st.sidebar.divider()
+
+    # ── Init backend ──
     st.sidebar.header("🔌 Connection Status")
     try:
-        table_leads, table_log = init_airtable(
-            secrets["airtable_key"],
-            secrets["airtable_base"],
-            leads_table=AIRTABLE_LEADS_TABLE,
-            log_table=AIRTABLE_LOG_TABLE,
-        )
-        st.sidebar.success("Airtable Connected")
+        backend = _init_backend(secrets, active_mode)
+        if active_mode == "supabase":
+            st.sidebar.success("Supabase Connected")
+        else:
+            st.sidebar.success("Airtable Connected")
     except Exception as e:
-        st.sidebar.error(f"Airtable Connection Failed: {e}")
+        st.sidebar.error(f"Backend Connection Failed: {e}")
         st.stop()
 
     if secrets["apify_token"]:
@@ -80,9 +118,7 @@ def main():
     )
 
     if "industry_options" not in st.session_state:
-        st.session_state["industry_options"] = get_industry_options(
-            secrets["airtable_key"], secrets["airtable_base"], AIRTABLE_LEADS_TABLE
-        )
+        st.session_state["industry_options"] = backend.get_industry_options()
 
     st.title("🚀 Lead Generation Engine")
 
@@ -125,7 +161,7 @@ def main():
 
                 result_data, credit_used_apify, credit_used_apollo, credit_used_instantly = execute_with_credit_tracking(
                     secrets,
-                    table_leads,
+                    backend,
                     industry,
                     city_input,
                     max_leads,
@@ -138,14 +174,13 @@ def main():
 
                 status_dashboard.update_status("Execution Complete!", 100)
 
-                log_transaction(
-                    table_log,
-                    industry,
-                    city_input,
-                    result_data["total_scraped"],
-                    result_data["new_added"],
-                    enrich_emails,
-                    result_data["status"],
+                backend.log_transaction(
+                    industry=industry,
+                    city_input=city_input,
+                    total_scraped=result_data["total_scraped"],
+                    new_added=result_data["new_added"],
+                    enrich_used=enrich_emails,
+                    status=result_data["status"],
                     error_msg=result_data["error_msg"],
                     credit_used_apify=credit_used_apify,
                     credit_used_apollo=credit_used_apollo,
@@ -195,8 +230,9 @@ def main():
             st.rerun()
 
         if "lead_df" not in st.session_state:
-            with st.spinner("Fetching leads from Airtable..."):
-                raw_leads = fetch_all_leads(table_leads)
+            source_label = "Supabase" if active_mode == "supabase" else "Airtable"
+            with st.spinner(f"Fetching leads from {source_label}..."):
+                raw_leads = backend.fetch_all_leads()
                 st.session_state["lead_df"] = pd.DataFrame(raw_leads)
 
         # Base DataFrame
@@ -276,7 +312,7 @@ def main():
                          # Smart Verification & Delta Cleanup workflow
                          sync_result = sync_with_verification(
                              pending_records,
-                             table_leads,
+                             backend,
                              secrets=secrets,
                              debug_mode=debug_mode,
                              max_records=MAX_SYNC_PER_RUN,
@@ -287,7 +323,7 @@ def main():
                          st.warning("⚠️ MillionVerifier key missing – syncing without email verification.")
                          sync_result = sync_pending_leads(
                              pending_records,
-                             table_leads,
+                             backend,
                              secrets=secrets,
                              debug_mode=debug_mode,
                              max_records=MAX_SYNC_PER_RUN,

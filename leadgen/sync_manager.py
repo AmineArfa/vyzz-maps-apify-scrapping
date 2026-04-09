@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import streamlit as st
 
-from .airtable_utils import batch_update_leads
+# batch_update_leads removed — using backend.batch_update() instead
 from .instantly import (
     delete_lead_from_instantly,
     export_leads_to_instantly,
@@ -244,7 +244,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
 
 def sync_pending_leads(
     pending_records: list[dict],
-    table_leads,
+    backend,
     *,
     secrets: dict,
     debug_mode: bool,
@@ -341,7 +341,7 @@ def sync_pending_leads(
     # 4. Final Airtable Batch Update
     if airtable_updates:
         status.write(f"📝 Finalizing {len(airtable_updates)} updates in Airtable...")
-        if batch_update_leads(table_leads, airtable_updates):
+        if backend.batch_update( airtable_updates):
             status.write(f"✅ Airtable updated ({success_count} leads successfully synced).")
         else:
             status.write("❌ Airtable update failed.")
@@ -516,7 +516,7 @@ def cleanup_bad_leads(
     # Batch update Airtable
     if airtable_updates:
         status.write(f"📝 Updating {len(airtable_updates)} bad-lead records in Airtable...")
-        if batch_update_leads(table_leads, airtable_updates):
+        if backend.batch_update( airtable_updates):
             status.write(
                 f"✅ Bad leads updated – {deleted_count} deleted from Instantly, "
                 f"{not_found_count} not found (already clean), {error_count} errors."
@@ -534,7 +534,7 @@ def cleanup_bad_leads(
 
 def sync_with_verification(
     pending_records: list[dict],
-    table_leads,
+    backend,
     *,
     secrets: dict,
     debug_mode: bool,
@@ -654,7 +654,7 @@ def sync_with_verification(
             f"📝 Saving verification_status='ok' for {len(mv_updates)} "
             f"newly verified leads..."
         )
-        if not batch_update_leads(table_leads, mv_updates):
+        if not backend.batch_update( mv_updates):
             status.write("⚠️ Failed to persist verification_status for good leads.")
 
     # ── Step 6: Merge results ────────────────────────────────────────────
