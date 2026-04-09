@@ -33,7 +33,7 @@ def main():
 
     # ── Backend toggle (Step 3.3) ──
     config_default = secrets.get("data_backend", "airtable")
-    supabase_available = bool(secrets.get("supabase_service_key"))
+    supabase_available = bool(secrets.get("supabase_db_url"))
 
     st.sidebar.header("⚙️ Data Backend")
     backend_options = ["airtable", "supabase"]

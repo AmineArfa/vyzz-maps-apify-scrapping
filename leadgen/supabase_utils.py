@@ -1,7 +1,11 @@
 """
 Supabase backend for the Lead Generation Engine (Step 3.3).
 
-Direct connection to raw.scraped_leads + raw.import_batches via supabase-py.
+Direct Postgres connection to raw.scraped_leads + raw.import_batches
+via a restricted `scraper_app` role (raw.* only — no access to
+public/crm/events schemas).
+
+Uses psycopg2 via Supavisor session-mode pooler.
 Implements the DataBackend protocol from backend.py.
 """
 
@@ -10,9 +14,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-import pandas as pd
+import psycopg2
+import psycopg2.extras
 import streamlit as st
-from supabase import create_client, Client
 
 from .json_sanitize import sanitize_for_json
 
@@ -31,9 +35,9 @@ APP_TO_SB: dict[str, str] = {
 SB_TO_APP: dict[str, str] = {v: k for k, v in APP_TO_SB.items()}
 
 # Fields that exist in the app but not in raw.scraped_leads — skip on insert
-SKIP_ON_INSERT = {"id", "createdTime", "last_modified_at"}
+SKIP_ON_INSERT = {"id", "createdTime", "last_modified_at", "created_at", "updated_at"}
 
-# All valid columns in raw.scraped_leads (for filtering)
+# All valid columns in raw.scraped_leads (for filtering writes)
 VALID_SB_COLUMNS = {
     "source_tool", "import_batch_id", "company_name", "industry", "website",
     "city", "state", "postal_code", "postal_address", "phone", "rating",
@@ -44,17 +48,29 @@ VALID_SB_COLUMNS = {
     "instantly_synced_at",
 }
 
-# Explicit column lists for reads
-DEDUP_COLUMNS = "website, phone"
-SYNC_COLUMNS = (
-    "id, company_name, industry, website, city, state, postal_code, "
-    "postal_address, phone, contact_name, contact_email, contact_position, "
-    "instantly_lead_id, instantly_campaign_id, instantly_status, "
-    "instantly_synced_at, updated_at, verification_status, "
-    "competitor1, competitor2, competitor3"
-)
+# Columns for INSERT (subset of VALID_SB_COLUMNS, fixed order for execute_values)
+INSERT_COLUMNS = [
+    "source_tool", "import_batch_id", "company_name", "industry", "website",
+    "city", "state", "postal_code", "postal_address", "phone", "rating",
+    "contact_name", "contact_email", "contact_position",
+    "competitor1", "competitor2", "competitor3",
+]
 
-# Hardcoded industry list (from current Airtable dropdown — no metadata API in Supabase)
+# Columns for dedup reads (minimal)
+DEDUP_QUERY = "SELECT website, phone FROM raw.scraped_leads WHERE website IS NOT NULL OR phone IS NOT NULL"
+
+# Columns for sync manager reads (21 of 26 — excludes source_tool, import_batch_id,
+# email_verified, verified_at, rating, created_at)
+SYNC_QUERY = """
+SELECT id, company_name, industry, website, city, state, postal_code,
+       postal_address, phone, contact_name, contact_email, contact_position,
+       instantly_lead_id, instantly_campaign_id, instantly_status,
+       instantly_synced_at, updated_at, verification_status,
+       competitor1, competitor2, competitor3
+FROM raw.scraped_leads
+"""
+
+# Hardcoded industry list (from current Airtable dropdown — no metadata API in Postgres)
 INDUSTRY_OPTIONS = [
     "Accounting", "Architecture", "Auto Repair", "Bakery", "Beauty Salon",
     "Brewery", "Car Dealership", "Catering", "Chiropractic", "Cleaning",
@@ -70,15 +86,16 @@ INDUSTRY_OPTIONS = [
 ]
 
 
-# ── Init ──────────────────────────────────────────────────────────────────
+# ── Connection management ─────────────────────────────────────────────────
 
-def init_supabase(secrets: dict) -> Client:
-    """Initialize Supabase client with service key."""
-    url = secrets.get("supabase_url", "")
-    key = secrets.get("supabase_service_key", "")
-    if not url or not key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required for Supabase mode")
-    return create_client(url, key)
+def connect_db(db_url: str) -> psycopg2.extensions.connection:
+    """Open a Postgres connection with statement timeout."""
+    conn = psycopg2.connect(
+        db_url,
+        options="-c statement_timeout=30000",  # 30s per query
+    )
+    conn.autocommit = False
+    return conn
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -90,9 +107,8 @@ def _map_record_to_sb(record: dict) -> dict:
         if key in SKIP_ON_INSERT:
             continue
         sb_key = APP_TO_SB.get(key, key)
-        if sb_key in VALID_SB_COLUMNS:
-            if value is not None:
-                mapped[sb_key] = value
+        if sb_key in VALID_SB_COLUMNS and value is not None:
+            mapped[sb_key] = value
     return mapped
 
 
@@ -105,82 +121,69 @@ def _map_record_to_app(record: dict) -> dict:
     return mapped
 
 
+def _row_to_insert_tuple(record: dict, source_tool: str, batch_id: str) -> tuple:
+    """Convert a mapped record to a tuple matching INSERT_COLUMNS order."""
+    mapped = _map_record_to_sb(record)
+    mapped["source_tool"] = source_tool
+    mapped["import_batch_id"] = batch_id
+    return tuple(mapped.get(col) for col in INSERT_COLUMNS)
+
+
 # ── Read: dedup (2 columns only) ─────────────────────────────────────────
 
-def fetch_existing_leads_sb(client: Client) -> tuple[set, set]:
-    """Fetch website + phone for dedup. Returns (set of websites, set of phones)."""
+def fetch_existing_leads_sb(conn: psycopg2.extensions.connection) -> tuple[set, set]:
+    """Fetch website + phone for dedup."""
     try:
-        # Paginate through all rows (Supabase default limit is 1000)
-        websites: set[str] = set()
-        phones: set[str] = set()
-        offset = 0
-        page_size = 1000
-
-        while True:
-            resp = (
-                client.schema("raw").table("scraped_leads")
-                .select(DEDUP_COLUMNS)
-                .range(offset, offset + page_size - 1)
-                .execute()
-            )
-            rows = resp.data or []
-            for row in rows:
-                web = row.get("website")
-                phone = row.get("phone")
+        with conn.cursor() as cur:
+            cur.execute(DEDUP_QUERY)
+            websites: set[str] = set()
+            phones: set[str] = set()
+            for row in cur:
+                web, phone = row
                 if web:
                     websites.add(str(web).strip().lower())
                 if phone:
                     p = "".join(filter(str.isdigit, str(phone)))
                     if p:
                         phones.add(p)
-            if len(rows) < page_size:
-                break
-            offset += page_size
-
-        return websites, phones
+            return websites, phones
     except Exception as e:
         st.error(f"Error fetching existing leads from Supabase: {e}")
+        conn.rollback()
         return set(), set()
 
 
 # ── Read: all leads for sync manager (21 columns) ────────────────────────
 
-def fetch_all_leads_sb(client: Client) -> list[dict]:
+def fetch_all_leads_sb(conn: psycopg2.extensions.connection) -> list[dict]:
     """Fetch leads for the sync manager. Returns list of dicts with app-internal field names."""
     try:
-        all_rows: list[dict] = []
-        offset = 0
-        page_size = 1000
-
-        while True:
-            resp = (
-                client.schema("raw").table("scraped_leads")
-                .select(SYNC_COLUMNS)
-                .range(offset, offset + page_size - 1)
-                .execute()
-            )
-            rows = resp.data or []
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(SYNC_QUERY)
+            rows = cur.fetchall()
+            result = []
             for row in rows:
-                mapped = _map_record_to_app(row)
-                # Rename 'updated_at' → 'last_modified_at' for sync manager compatibility
+                mapped = _map_record_to_app(dict(row))
+                # Rename updated_at → last_modified_at for sync manager compatibility
                 if "updated_at" in mapped:
                     mapped["last_modified_at"] = mapped.pop("updated_at")
-                # Keep 'id' as-is (UUID string, not Airtable recXXX)
-                all_rows.append(mapped)
-            if len(rows) < page_size:
-                break
-            offset += page_size
-
-        return all_rows
+                # Convert datetime objects to ISO strings for pandas compatibility
+                for key in ("last_modified_at", "last_synced_at"):
+                    val = mapped.get(key)
+                    if val and hasattr(val, "isoformat"):
+                        mapped[key] = val.isoformat()
+                result.append(mapped)
+            return result
     except Exception as e:
         st.error(f"Error fetching leads from Supabase: {e}")
+        conn.rollback()
         return []
 
 
 # ── Write: batch create with import_batches tracking ─────────────────────
 
 def batch_create_leads_sb(
-    client: Client,
+    conn: psycopg2.extensions.connection,
     records: list[dict],
     source_tool: str,
     industry: str,
@@ -188,85 +191,83 @@ def batch_create_leads_sb(
 ) -> str | None:
     """
     Create leads in raw.scraped_leads with import_batches tracking.
-    Owns the full lifecycle of one import_batches row.
-    Returns the batch_id on success, None on failure.
+    Commits per chunk (500 rows). Not one giant transaction.
+    Returns batch_id on success.
     """
     if not records:
         return None
 
     batch_id = None
-    try:
-        # 1. Create import_batches row
-        batch_resp = (
-            client.schema("raw").table("import_batches")
-            .insert({
-                "source": source_tool,
-                "industry": industry or None,
-                "city": city or None,
-                "total_scraped": len(records),
-                "status": "running",
-            })
-            .execute()
-        )
-        batch_id = batch_resp.data[0]["id"] if batch_resp.data else None
-        if not batch_id:
-            raise ValueError("Failed to create import batch")
+    chunk_size = 500
 
-        # 2. Map and insert leads in chunks of 100
-        chunk_size = 100
+    try:
+        # 1. Create import_batches row (committed immediately)
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO raw.import_batches (source, industry, city, total_scraped, status)
+                   VALUES (%s, %s, %s, %s, 'running') RETURNING id""",
+                (source_tool, industry or None, city or None, len(records)),
+            )
+            batch_id = str(cur.fetchone()[0])
+        conn.commit()
+
+        # 2. Insert leads in chunks via execute_values
         total_inserted = 0
+        insert_sql = f"""
+            INSERT INTO raw.scraped_leads ({', '.join(INSERT_COLUMNS)})
+            VALUES %s
+        """
 
         for i in range(0, len(records), chunk_size):
             chunk = records[i : i + chunk_size]
-            sb_rows = []
-            for record in chunk:
-                mapped = _map_record_to_sb(record)
-                mapped["source_tool"] = source_tool
-                mapped["import_batch_id"] = batch_id
-                sb_rows.append(sanitize_for_json(mapped))
+            values = [_row_to_insert_tuple(r, source_tool, batch_id) for r in chunk]
+            values = sanitize_for_json(values)  # clean NaN/Infinity
 
-            client.schema("raw").table("scraped_leads").insert(sb_rows).execute()
-            total_inserted += len(sb_rows)
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur, insert_sql, values,
+                    template=None,
+                    page_size=len(values),
+                )
+            conn.commit()
+            total_inserted += len(chunk)
 
         # 3. Mark batch completed
         now_iso = datetime.now(timezone.utc).isoformat()
-        (
-            client.schema("raw").table("import_batches")
-            .update({
-                "status": "completed",
-                "new_added": total_inserted,
-                "completed_at": now_iso,
-            })
-            .eq("id", batch_id)
-            .execute()
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE raw.import_batches
+                   SET status = 'completed', new_added = %s, completed_at = %s
+                   WHERE id = %s::uuid""",
+                (total_inserted, now_iso, batch_id),
+            )
+        conn.commit()
 
         return batch_id
 
     except Exception as e:
-        # Mark batch failed (batch row persists, leads may be partial)
+        conn.rollback()
+        # Mark batch failed
         if batch_id:
             try:
                 now_iso = datetime.now(timezone.utc).isoformat()
-                (
-                    client.schema("raw").table("import_batches")
-                    .update({
-                        "status": "failed",
-                        "error_message": str(e)[:500],
-                        "completed_at": now_iso,
-                    })
-                    .eq("id", batch_id)
-                    .execute()
-                )
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE raw.import_batches
+                           SET status = 'failed', error_message = %s, completed_at = %s
+                           WHERE id = %s::uuid""",
+                        (str(e)[:500], now_iso, batch_id),
+                    )
+                conn.commit()
             except Exception:
-                pass
+                conn.rollback()
         st.error(f"Supabase batch create failed: {e}")
         return None
 
 
 # ── Update: after Instantly sync ──────────────────────────────────────────
 
-def batch_update_leads_sb(client: Client, updates: list[dict]) -> bool:
+def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[dict]) -> bool:
     """
     Update leads in raw.scraped_leads.
     updates: list of {'id': uuid_str, 'fields': {field: value}}.
@@ -276,31 +277,38 @@ def batch_update_leads_sb(client: Client, updates: list[dict]) -> bool:
         return True
 
     try:
-        for update in updates:
-            row_id = update.get("id")
-            fields = update.get("fields", {})
-            if not row_id or not fields:
-                continue
+        with conn.cursor() as cur:
+            for update in updates:
+                row_id = update.get("id")
+                fields = update.get("fields", {})
+                if not row_id or not fields:
+                    continue
 
-            # Map field names to Supabase columns
-            sb_fields: dict[str, Any] = {}
-            for key, value in fields.items():
-                sb_key = APP_TO_SB.get(key, key)
-                if sb_key in VALID_SB_COLUMNS:
-                    sb_fields[sb_key] = value
+                # Map field names + build SET clause
+                set_parts = []
+                params = []
+                for key, value in fields.items():
+                    sb_key = APP_TO_SB.get(key, key)
+                    if sb_key in VALID_SB_COLUMNS:
+                        set_parts.append(f"{sb_key} = %s")
+                        params.append(value)
 
-            # Always set updated_at to track modification time
-            sb_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+                if not set_parts:
+                    continue
 
-            (
-                client.schema("raw").table("scraped_leads")
-                .update(sanitize_for_json(sb_fields))
-                .eq("id", row_id)
-                .execute()
-            )
+                # Always set updated_at
+                set_parts.append("updated_at = NOW()")
+                params.append(row_id)
 
+                cur.execute(
+                    f"UPDATE raw.scraped_leads SET {', '.join(set_parts)} WHERE id = %s::uuid",
+                    params,
+                )
+
+        conn.commit()
         return True
     except Exception as e:
+        conn.rollback()
         st.error(f"Supabase batch update failed: {e}")
         return False
 
@@ -308,17 +316,19 @@ def batch_update_leads_sb(client: Client, updates: list[dict]) -> bool:
 # ── SupabaseBackend class (implements DataBackend protocol) ───────────────
 
 class SupabaseBackend:
-    """Direct Supabase backend. Wraps supabase_utils functions."""
+    """Direct Postgres backend using restricted scraper_app role."""
 
     def __init__(self, secrets: dict):
-        self.client = init_supabase(secrets)
-        self.secrets = secrets
+        db_url = secrets.get("supabase_db_url", "")
+        if not db_url:
+            raise ValueError("SUPABASE_DB_URL is required for Supabase mode")
+        self.conn = connect_db(db_url)
 
     def fetch_existing_leads(self) -> tuple[set, set]:
-        return fetch_existing_leads_sb(self.client)
+        return fetch_existing_leads_sb(self.conn)
 
     def fetch_all_leads(self) -> list[dict]:
-        return fetch_all_leads_sb(self.client)
+        return fetch_all_leads_sb(self.conn)
 
     def batch_create(
         self,
@@ -327,10 +337,10 @@ class SupabaseBackend:
         industry: str,
         city: str,
     ) -> str | None:
-        return batch_create_leads_sb(self.client, records, source_tool, industry, city)
+        return batch_create_leads_sb(self.conn, records, source_tool, industry, city)
 
     def batch_update(self, updates: list[dict]) -> bool:
-        return batch_update_leads_sb(self.client, updates)
+        return batch_update_leads_sb(self.conn, updates)
 
     def log_transaction(self, **kwargs) -> None:
         # No-op: import_batches row (created by batch_create) IS the log
@@ -340,9 +350,15 @@ class SupabaseBackend:
         return INDUSTRY_OPTIONS
 
     def get_writable_field_names(self, table_id: str) -> set[str]:
-        # All mapped fields are writable in Supabase (no computed fields)
+        # All mapped fields are writable (no computed fields in Postgres)
         return VALID_SB_COLUMNS
 
     def filter_fields(self, record: dict) -> dict:
-        """Filter to valid Supabase fields, mapping names."""
         return _map_record_to_sb(record)
+
+    def __del__(self):
+        try:
+            if hasattr(self, "conn") and self.conn and not self.conn.closed:
+                self.conn.close()
+        except Exception:
+            pass

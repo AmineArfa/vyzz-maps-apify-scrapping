@@ -17,9 +17,8 @@ def get_secrets():
             "millionverifier_key": st.secrets.get("MILLIONVERIFIER_API_KEY", ""),
             # Backend toggle (Step 3.3): "supabase" or "airtable"
             "data_backend": st.secrets.get("DATA_BACKEND", "airtable").strip().lower(),
-            # Supabase credentials (required when data_backend = "supabase")
-            "supabase_url": st.secrets.get("SUPABASE_URL", ""),
-            "supabase_service_key": st.secrets.get("SUPABASE_SERVICE_KEY", ""),
+            # Supabase connection (restricted scraper_app role — raw.* only)
+            "supabase_db_url": st.secrets.get("SUPABASE_DB_URL", ""),
         }
     except FileNotFoundError:
         st.error("Secrets file not found. Please create `.streamlit/secrets.toml`.")
