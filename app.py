@@ -2,6 +2,8 @@ import io
 
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from leadgen.backend import AirtableBackend
 from leadgen.config import get_secrets
@@ -16,6 +18,22 @@ AIRTABLE_LEADS_TABLE = "tblKrC9hOxCuMMyZT"
 AIRTABLE_LOG_TABLE = "log"
 SCRAPPING_TOOL_ID = "maps_apify_apollo"
 MAX_SYNC_PER_RUN = 5000
+
+DEFAULT_INDUSTRIES = [
+    "Dentist",
+    "Family lawyer",
+    "Immigration lawyer",
+    "Interior Design",
+    "Personal injury lawyer",
+    "Property management",
+    "Real Estate and Trust lawyer",
+    "Med Spa",
+    "Clinic Services",
+    "Elder and Disabled Care",
+    "Hotels and Leisure",
+    "Restaurants and Bars",
+    "Consulting Services (B2B)",
+]
 
 
 st.set_page_config(page_title="Lead Generation Engine", page_icon="🚀", layout="wide")
@@ -232,73 +250,144 @@ def main():
     with tab_man:
         st.info("💡 **Lead Manager**: Import leads via CSV, review pending syncs, and push to Instantly.")
 
-        # ── CSV Import Section ──
-        with st.expander("📥 Import Leads from CSV", expanded=False):
-            # Template download
+        # ── Industry Management ──
+        if "industries" not in st.session_state:
+            st.session_state["industries"] = list(DEFAULT_INDUSTRIES)
+
+        with st.expander("🏷️ Manage Industries", expanded=False):
+            st.caption("Industries used for campaign targeting. Edit the list below.")
+            col_add, col_remove = st.columns(2)
+            with col_add:
+                new_industry = st.text_input("Add industry", key="new_industry_input", placeholder="e.g. Veterinary Clinic")
+                if st.button("➕ Add", key="add_industry_btn") and new_industry.strip():
+                    name = new_industry.strip()
+                    if name not in st.session_state["industries"]:
+                        st.session_state["industries"].append(name)
+                        st.session_state["industries"].sort()
+                        st.rerun()
+                    else:
+                        st.warning(f"'{name}' already exists.")
+            with col_remove:
+                if st.session_state["industries"]:
+                    to_remove = st.selectbox("Remove industry", st.session_state["industries"], key="remove_industry_select")
+                    if st.button("🗑️ Remove", key="remove_industry_btn"):
+                        st.session_state["industries"].remove(to_remove)
+                        st.rerun()
+            st.write(f"**{len(st.session_state['industries'])} industries**: {', '.join(st.session_state['industries'])}")
+
+        # ── Import Leads ──
+        with st.expander("📥 Import Leads", expanded=False):
             TEMPLATE_COLUMNS = [
                 "company_name", "industry", "website", "city", "state",
                 "postal_code", "postal_address", "phone", "rating",
                 "contact_name", "contact_email", "contact_position",
                 "competitor1", "competitor2", "competitor3",
             ]
-            template_df = pd.DataFrame(columns=TEMPLATE_COLUMNS)
-            template_csv = template_df.to_csv(index=False)
+
+            # Build Excel template with two sheets
+            def build_template_xlsx() -> bytes:
+                wb = Workbook()
+
+                # Sheet 1: Leads template
+                ws_leads = wb.active
+                ws_leads.title = "Leads"
+                for col_idx, col_name in enumerate(TEMPLATE_COLUMNS, 1):
+                    ws_leads.cell(row=1, column=col_idx, value=col_name)
+                # Set column widths
+                for col_idx in range(1, len(TEMPLATE_COLUMNS) + 1):
+                    ws_leads.column_dimensions[ws_leads.cell(row=1, column=col_idx).column_letter].width = 18
+
+                # Sheet 2: Industries reference
+                ws_industries = wb.create_sheet("Industries")
+                ws_industries.cell(row=1, column=1, value="industry")
+                for row_idx, ind in enumerate(st.session_state["industries"], 2):
+                    ws_industries.cell(row=row_idx, column=1, value=ind)
+                ws_industries.column_dimensions["A"].width = 30
+
+                # Data validation on industry column (column B = index 2)
+                industry_count = len(st.session_state["industries"])
+                if industry_count > 0:
+                    dv = DataValidation(
+                        type="list",
+                        formula1=f"Industries!$A$2:$A${industry_count + 1}",
+                        allow_blank=True,
+                    )
+                    dv.error = "Pick an industry from the Industries sheet."
+                    dv.errorTitle = "Invalid Industry"
+                    dv.prompt = "Select an industry from the dropdown."
+                    dv.promptTitle = "Industry"
+                    ws_leads.add_data_validation(dv)
+                    dv.add(f"B2:B10000")  # Column B = industry
+
+                buf = io.BytesIO()
+                wb.save(buf)
+                return buf.getvalue()
 
             st.download_button(
-                "📄 Download Template CSV",
-                data=template_csv,
-                file_name="vyzz_lead_import_template.csv",
-                mime="text/csv",
-                help="Download the CSV template with the correct column headers. Fill it with your leads and upload below.",
+                "📄 Download Import Template (.xlsx)",
+                data=build_template_xlsx(),
+                file_name="vyzz_lead_import_template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Excel template with lead columns + industry dropdown. Fill Sheet 1 and upload below.",
             )
 
             st.caption("**Required**: `company_name`. **Recommended**: `contact_email`, `industry`, `website`.")
+            st.caption("The `industry` column has a dropdown — pick from the Industries sheet.")
 
-            # File upload
+            # File upload (CSV or Excel)
             uploaded_file = st.file_uploader(
-                "Upload filled CSV",
-                type=["csv"],
-                key="csv_uploader",
-                help="Upload a CSV file with the same columns as the template.",
+                "Upload filled template",
+                type=["csv", "xlsx"],
+                key="lead_uploader",
+                help="Upload the filled template (CSV or Excel).",
             )
 
             if uploaded_file is not None:
                 try:
-                    csv_df = pd.read_csv(uploaded_file)
+                    if uploaded_file.name.endswith(".xlsx"):
+                        import_df = pd.read_excel(uploaded_file, sheet_name="Leads", engine="openpyxl")
+                    else:
+                        import_df = pd.read_csv(uploaded_file)
 
                     # Validate
-                    if "company_name" not in csv_df.columns:
-                        st.error("CSV must have a `company_name` column.")
-                    elif csv_df.empty:
-                        st.warning("CSV is empty.")
+                    if "company_name" not in import_df.columns:
+                        st.error("File must have a `company_name` column.")
+                    elif import_df.empty:
+                        st.warning("File is empty.")
                     else:
                         # Drop columns not in template
-                        valid_cols = [c for c in csv_df.columns if c in TEMPLATE_COLUMNS]
-                        csv_df = csv_df[valid_cols]
+                        valid_cols = [c for c in import_df.columns if c in TEMPLATE_COLUMNS]
+                        import_df = import_df[valid_cols]
 
                         # Drop rows with no company_name
-                        csv_df = csv_df.dropna(subset=["company_name"])
-                        csv_df = csv_df[csv_df["company_name"].str.strip() != ""]
+                        import_df = import_df.dropna(subset=["company_name"])
+                        import_df = import_df[import_df["company_name"].astype(str).str.strip() != ""]
 
-                        st.write(f"**{len(csv_df)} valid leads** found in CSV.")
-                        st.dataframe(csv_df.head(10), use_container_width=True)
+                        # Warn on unknown industries
+                        if "industry" in import_df.columns:
+                            known = set(st.session_state["industries"])
+                            unknown = set(import_df["industry"].dropna().unique()) - known
+                            if unknown:
+                                st.warning(f"⚠️ Unknown industries: {', '.join(sorted(unknown))}. They will still be imported.")
 
-                        # Industry / city for batch metadata
-                        csv_industry = csv_df["industry"].mode().iloc[0] if "industry" in csv_df.columns and not csv_df["industry"].dropna().empty else "Unknown"
-                        csv_city = csv_df["city"].mode().iloc[0] if "city" in csv_df.columns and not csv_df["city"].dropna().empty else "Unknown"
+                        st.write(f"**{len(import_df)} valid leads** found.")
+                        st.dataframe(import_df.head(10), use_container_width=True)
 
-                        if st.button(f"🚀 Import {len(csv_df)} Leads", type="primary", key="csv_import_btn"):
-                            records = csv_df.where(csv_df.notna(), None).to_dict("records")
+                        # Batch metadata from most common values
+                        batch_industry = import_df["industry"].mode().iloc[0] if "industry" in import_df.columns and not import_df["industry"].dropna().empty else "Unknown"
+                        batch_city = import_df["city"].mode().iloc[0] if "city" in import_df.columns and not import_df["city"].dropna().empty else "Unknown"
+
+                        if st.button(f"🚀 Import {len(import_df)} Leads", type="primary", key="import_btn"):
+                            records = import_df.where(import_df.notna(), None).to_dict("records")
                             with st.spinner(f"Importing {len(records)} leads..."):
                                 batch_id = backend.batch_create(
                                     records,
                                     source_tool="csv_import",
-                                    industry=csv_industry,
-                                    city=csv_city,
+                                    industry=batch_industry,
+                                    city=batch_city,
                                 )
                             if batch_id is not None:
                                 st.success(f"✅ Imported {len(records)} leads (batch: `{batch_id}`)")
-                                # Invalidate cache
                                 if "lead_df" in st.session_state:
                                     del st.session_state["lead_df"]
                             else:
@@ -309,7 +398,7 @@ def main():
                                 else:
                                     st.error("Import failed. Check the logs above.")
                 except Exception as e:
-                    st.error(f"Failed to read CSV: {e}")
+                    st.error(f"Failed to read file: {e}")
 
         st.divider()
 
