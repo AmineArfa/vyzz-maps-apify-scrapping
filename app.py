@@ -1,3 +1,5 @@
+import io
+
 import pandas as pd
 import streamlit as st
 
@@ -123,10 +125,16 @@ def main():
     st.title("🚀 Lead Generation Engine")
 
     # --- TABS ---
-    tab_gen, tab_man = st.tabs(["🚀 Lead Generator", "📝 Lead Manager"])
+    show_legacy_generator = st.sidebar.checkbox("Show Legacy Generator", value=False, help="Show the Apify/Apollo scraping tab (legacy)")
+    if show_legacy_generator:
+        tab_gen, tab_man = st.tabs(["🚀 Lead Generator (Legacy)", "📝 Lead Manager"])
+    else:
+        tab_man = st.tabs(["📝 Lead Manager"])[0]
+        tab_gen = None
 
-    # --- TAB 1: GENERATOR ---
-    with tab_gen:
+    # --- TAB 1: GENERATOR (Legacy, hidden by default) ---
+    if tab_gen is not None:
+      with tab_gen:
         col1, col2, col3 = st.columns([2, 2, 1])
         with col1:
             def on_industry_change():
@@ -220,9 +228,90 @@ def main():
                     debug=st.session_state.get("debug_mode", False),
                 )
 
-    # --- TAB 2: SYNC MANAGER (AIRTABLE FIRST) ---
+    # --- TAB 2: LEAD MANAGER ---
     with tab_man:
-        st.info("💡 **Sync Manager**: Edit data in Airtable. When you save there, changes appear here as 'Pending'. Click Sync to push to Instantly.")
+        st.info("💡 **Lead Manager**: Import leads via CSV, review pending syncs, and push to Instantly.")
+
+        # ── CSV Import Section ──
+        with st.expander("📥 Import Leads from CSV", expanded=False):
+            # Template download
+            TEMPLATE_COLUMNS = [
+                "company_name", "industry", "website", "city", "state",
+                "postal_code", "postal_address", "phone", "rating",
+                "contact_name", "contact_email", "contact_position",
+                "competitor1", "competitor2", "competitor3",
+            ]
+            template_df = pd.DataFrame(columns=TEMPLATE_COLUMNS)
+            template_csv = template_df.to_csv(index=False)
+
+            st.download_button(
+                "📄 Download Template CSV",
+                data=template_csv,
+                file_name="vyzz_lead_import_template.csv",
+                mime="text/csv",
+                help="Download the CSV template with the correct column headers. Fill it with your leads and upload below.",
+            )
+
+            st.caption("**Required**: `company_name`. **Recommended**: `contact_email`, `industry`, `website`.")
+
+            # File upload
+            uploaded_file = st.file_uploader(
+                "Upload filled CSV",
+                type=["csv"],
+                key="csv_uploader",
+                help="Upload a CSV file with the same columns as the template.",
+            )
+
+            if uploaded_file is not None:
+                try:
+                    csv_df = pd.read_csv(uploaded_file)
+
+                    # Validate
+                    if "company_name" not in csv_df.columns:
+                        st.error("CSV must have a `company_name` column.")
+                    elif csv_df.empty:
+                        st.warning("CSV is empty.")
+                    else:
+                        # Drop columns not in template
+                        valid_cols = [c for c in csv_df.columns if c in TEMPLATE_COLUMNS]
+                        csv_df = csv_df[valid_cols]
+
+                        # Drop rows with no company_name
+                        csv_df = csv_df.dropna(subset=["company_name"])
+                        csv_df = csv_df[csv_df["company_name"].str.strip() != ""]
+
+                        st.write(f"**{len(csv_df)} valid leads** found in CSV.")
+                        st.dataframe(csv_df.head(10), use_container_width=True)
+
+                        # Industry / city for batch metadata
+                        csv_industry = csv_df["industry"].mode().iloc[0] if "industry" in csv_df.columns and not csv_df["industry"].dropna().empty else "Unknown"
+                        csv_city = csv_df["city"].mode().iloc[0] if "city" in csv_df.columns and not csv_df["city"].dropna().empty else "Unknown"
+
+                        if st.button(f"🚀 Import {len(csv_df)} Leads", type="primary", key="csv_import_btn"):
+                            records = csv_df.where(csv_df.notna(), None).to_dict("records")
+                            with st.spinner(f"Importing {len(records)} leads..."):
+                                batch_id = backend.batch_create(
+                                    records,
+                                    source_tool="csv_import",
+                                    industry=csv_industry,
+                                    city=csv_city,
+                                )
+                            if batch_id is not None:
+                                st.success(f"✅ Imported {len(records)} leads (batch: `{batch_id}`)")
+                                # Invalidate cache
+                                if "lead_df" in st.session_state:
+                                    del st.session_state["lead_df"]
+                            else:
+                                if active_mode == "airtable":
+                                    st.success(f"✅ Imported {len(records)} leads to Airtable")
+                                    if "lead_df" in st.session_state:
+                                        del st.session_state["lead_df"]
+                                else:
+                                    st.error("Import failed. Check the logs above.")
+                except Exception as e:
+                    st.error(f"Failed to read CSV: {e}")
+
+        st.divider()
 
         if st.button("🔄 Refresh Data"):
             if "lead_df" in st.session_state:
