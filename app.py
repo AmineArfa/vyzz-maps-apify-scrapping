@@ -435,12 +435,22 @@ def main():
         def is_pending(row):
             mod = row["last_modified_at"]
             syn = row["last_synced_at"]
+
+            # Historical backfill guard: rows explicitly marked as having a
+            # stale Instantly ID (Phase D Step 3.8 C2a-stale cohort) must NOT
+            # be auto-re-pushed. Their instantly_lead_id was cleared on
+            # purpose, and auto-pushing them re-burns MillionVerifier credits
+            # and risks creating duplicates if the original lead still exists
+            # elsewhere in Instantly. Operator must re-verify cohort manually.
+            status = row.get("instantly_statuts")
+            if status == "stale_reference_cleared":
+                return False
+
             if pd.isna(mod): return False # Should not happen if Airtable tracks it
             if pd.isna(syn): return True # Never synced
 
             # Recovery: leads wrongly blocked as catch_all/unknown need re-syncing.
             # They have last_synced_at set but were never actually added to Instantly.
-            status = row.get("instantly_statuts")
             v_status = row.get("verification_status", "")
             if status == "Blocked" and str(v_status).strip().lower() in ("catch_all", "unknown", ""):
                 return True

@@ -271,7 +271,19 @@ def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[di
     """
     Update leads in raw.scraped_leads.
     updates: list of {'id': uuid_str, 'fields': {field: value}}.
-    Maps field names and explicitly sets updated_at=NOW().
+    Maps field names.
+
+    updated_at handling:
+      - If the update includes instantly_synced_at (last_synced_at), we set
+        updated_at := instantly_synced_at so the "pending" filter
+        (updated_at > instantly_synced_at) does not immediately re-trigger.
+      - Otherwise, updated_at := NOW().
+
+    Previously this always did updated_at=NOW(), which caused sync writes to
+    leave updated_at strictly after the captured instantly_synced_at value
+    (captured once at the start of sync_pending_leads). Result: every synced
+    row immediately reappeared in the pending list → infinite re-push loop.
+    See: 2026-04-11 incident, 4,228-row accidental re-push.
     """
     if not updates:
         return True
@@ -287,17 +299,25 @@ def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[di
                 # Map field names + build SET clause
                 set_parts = []
                 params = []
+                sync_ts_value = None
                 for key, value in fields.items():
                     sb_key = APP_TO_SB.get(key, key)
                     if sb_key in VALID_SB_COLUMNS:
                         set_parts.append(f"{sb_key} = %s")
                         params.append(value)
+                        if sb_key == "instantly_synced_at":
+                            sync_ts_value = value
 
                 if not set_parts:
                     continue
 
-                # Always set updated_at
-                set_parts.append("updated_at = NOW()")
+                # Pin updated_at to instantly_synced_at when we're writing one,
+                # so the "pending" filter does not immediately re-trigger.
+                if sync_ts_value is not None:
+                    set_parts.append("updated_at = %s")
+                    params.append(sync_ts_value)
+                else:
+                    set_parts.append("updated_at = NOW()")
                 params.append(row_id)
 
                 cur.execute(
