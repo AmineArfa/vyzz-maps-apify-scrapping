@@ -428,20 +428,20 @@ def _process_bad_lead(lead: dict, *, api_key: str, debug_mode: bool) -> dict:
 
 def cleanup_bad_leads(
     bad_leads: list[tuple[dict, str]],
-    table_leads,
+    backend,
     *,
     secrets: dict,
     debug_mode: bool,
     status,
 ) -> dict:
-    """Remove bad leads from Instantly and update Airtable.
+    """Remove bad leads from Instantly and update the backend store.
 
     Parameters
     ----------
     bad_leads : list[tuple[dict, str]]
         Each element is ``(record_dict, verification_status)``.
-    table_leads
-        Airtable table object for batch updates.
+    backend
+        DataBackend instance (Airtable or Supabase) for batch updates.
     secrets : dict
         Application secrets (needs ``instantly_key``).
     debug_mode : bool
@@ -620,7 +620,7 @@ def sync_with_verification(
         )
         sync_result = sync_pending_leads(
             leads_to_sync,
-            table_leads,
+            backend,
             secrets=secrets,
             debug_mode=debug_mode,
             max_records=max_records,
@@ -636,7 +636,7 @@ def sync_with_verification(
     if bad_leads:
         cleanup_result = cleanup_bad_leads(
             bad_leads,
-            table_leads,
+            backend,
             secrets=secrets,
             debug_mode=debug_mode,
             status=status,
