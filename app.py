@@ -567,36 +567,95 @@ def main():
                 f"📋 Last Sync Log ({res['timestamp']}) - {res['count']} Successes / {failures} Failures{blocked_text}{deferred_text}",
                 expanded=True,
             ):
-                # Blocked leads summary (from MillionVerifier)
+                # ── Top-line counters ───────────────────────────────────
+                details = res.get("details") or []
+                from collections import Counter as _C
+                op_counts = _C()
+                for item in details:
+                    if item.get("status") == "Success":
+                        op_counts[item.get("op", "Sync")] += 1
+                    elif item.get("status") == "Blocked":
+                        op_counts["Blocked"] += 1
+                    else:
+                        op_counts["Failed"] += 1
+
+                cols = st.columns(max(len(op_counts), 1))
+                for col, (op_name, cnt) in zip(cols, op_counts.most_common()):
+                    col.metric(op_name, cnt)
+
                 if blocked:
                     blocked_deleted = res.get("blocked_deleted", 0)
-                    st.write(
-                        f"**🛡️ Email Verification**: {blocked} leads blocked "
+                    st.caption(
+                        f"🛡️ Email Verification: {blocked} leads blocked "
                         f"({blocked_deleted} removed from Instantly)"
                     )
-                    st.divider()
 
                 fc = res.get("failure_counts") or {}
                 if fc:
-                    st.write("**Failure breakdown**")
-                    for k, v in sorted(fc.items(), key=lambda kv: kv[1], reverse=True):
-                        samples = ", ".join((res.get("failure_samples") or {}).get(k, [])[:5])
-                        st.write(f"- **{k}**: {v} (sample rows: {samples})")
-                    st.write(
-                        "**Notes**: `nan_json` means a NaN/Infinity sneaked into a payload; "
-                        "`rate_limited` is Instantly 429; `missing_config` usually means missing Instantly key or campaign creation failed."
+                    with st.expander("⚠️ Failure breakdown by category", expanded=False):
+                        for k, v in sorted(fc.items(), key=lambda kv: kv[1], reverse=True):
+                            samples = ", ".join((res.get("failure_samples") or {}).get(k, [])[:5])
+                            st.write(f"- **{k}**: {v} (sample rows: {samples})")
+                        st.caption(
+                            "`nan_json` = NaN/Infinity in payload · "
+                            "`rate_limited` = Instantly 429 · "
+                            "`missing_config` = missing Instantly key or campaign creation failed"
+                        )
+
+                # ── Per-lead summary table ──────────────────────────────
+                if details:
+                    table_rows = []
+                    for item in details:
+                        if item.get("status") == "Success":
+                            op = item.get("op", "Sync")
+                        elif item.get("status") == "Blocked":
+                            op = "Blocked"
+                        else:
+                            op = "Failed"
+                        new_id = item.get("new_instantly_id")
+                        table_rows.append({
+                            "op": op,
+                            "email": item.get("email") or "—",
+                            "company": item.get("company_name") or "—",
+                            "industry": item.get("industry") or "—",
+                            "city": item.get("city") or "—",
+                            "verification": item.get("verification_status") or "—",
+                            "campaign": item.get("campaign_name") or "—",
+                            "instantly_id": (new_id[:8] + "…") if isinstance(new_id, str) and len(new_id) > 8 else (new_id or "—"),
+                            "error": item.get("error") or "",
+                        })
+
+                    import pandas as _pd
+                    df_log = _pd.DataFrame(table_rows)
+
+                    # Optional op filter
+                    all_ops = sorted(df_log["op"].dropna().unique().tolist())
+                    selected_ops = st.multiselect(
+                        "Filter by operation",
+                        options=all_ops,
+                        default=all_ops,
+                        key="sync_log_op_filter",
                     )
-                    st.divider()
-                for item in res["details"]:
-                    if item.get("status") == "Success":
-                        op = item.get("op", "Sync")
-                        st.write(f"✅ **{item['id']}**: {op} successful")
-                    elif item.get("status") == "Blocked":
-                        v_status = item.get("verification_status", "bad")
-                        st.write(f"🛡️ **{item['id']}**: Blocked ({v_status})")
-                    else:
-                        st.error(f"❌ **{item['id']}**: {item.get('error') or item.get('status')}")
-                
+                    if selected_ops:
+                        df_log = df_log[df_log["op"].isin(selected_ops)]
+
+                    st.dataframe(
+                        df_log,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "op": st.column_config.TextColumn("Op", width="small"),
+                            "email": st.column_config.TextColumn("Email"),
+                            "company": st.column_config.TextColumn("Company"),
+                            "industry": st.column_config.TextColumn("Industry", width="small"),
+                            "city": st.column_config.TextColumn("City", width="small"),
+                            "verification": st.column_config.TextColumn("MV", width="small"),
+                            "campaign": st.column_config.TextColumn("Campaign"),
+                            "instantly_id": st.column_config.TextColumn("Instantly ID", width="small"),
+                            "error": st.column_config.TextColumn("Error"),
+                        },
+                    )
+
                 if st.button("🧹 Clear Logs"):
                     del st.session_state["last_sync_results"]
                     st.rerun()

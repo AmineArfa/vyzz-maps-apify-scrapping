@@ -77,7 +77,7 @@ def _build_patch_payload(clean_data: dict, instantly_lead_id: str | None = None)
 def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
     """
     Process a single lead for sync to Instantly.
-    
+
     Handles all scenarios:
     - New lead with email that may or may not exist in Instantly
     - Existing lead with same email (update)
@@ -112,14 +112,26 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
     if isinstance(industry, list):
         industry = industry[0]
 
+    # Per-lead display info carried on every return so the summary table
+    # (rendered at the end of sync_pending_leads) has a full row even
+    # for failures. None of these are used by the Instantly API call.
+    display_info = {
+        "email": email,
+        "company_name": clean_data.get("company_name"),
+        "industry": industry,
+        "city": clean_data.get("city"),
+    }
+
     # Campaign ID - module-level lock in instantly.py prevents duplicates
     camp_name = f"{industry} - Cold Outreach"
     c_id = find_or_create_instantly_campaign(api_key, camp_name, debug=debug_mode)
+    display_info["campaign_name"] = camp_name
     if not c_id:
         return {
             "id": lead_id_airtable,
             "status": "Failed",
             "error": f"Create Failed: No campaign available for '{camp_name}' (check Instantly API key / rate limit / permissions)",
+            **display_info,
         }
 
     # Result tracker
@@ -165,7 +177,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
                         else:
                             # Both failed — keep existing lead untouched
                             operation = "Update"
-                            return {"id": lead_id_airtable, "status": "Failed", "error": f"Update failed ({err}), Create also failed: {create_err}"}
+                            return {"id": lead_id_airtable, "status": "Failed", "error": f"Update failed ({err}), Create also failed: {create_err}", **display_info}
             else:
                 # A1b: Email changed OR lead doesn't exist in Instantly anymore
                 # Always try to add to campaign first (don't search — search is global).
@@ -186,7 +198,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
                             delete_lead_from_instantly(api_key, lead_id_instantly)
                     elif create_err:
                         # Both failed — keep existing lead untouched
-                        return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, create failed: {create_err}"}
+                        return {"id": lead_id_airtable, "status": "Failed", "error": f"Email changed, create failed: {create_err}", **display_info}
                     else:
                         # Skipped (already in campaign) but search didn't find it
                         new_instantly_id = lead_id_instantly
@@ -197,7 +209,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
             success, err = delete_lead_from_instantly(api_key, lead_id_instantly, debug=debug_mode)
             new_instantly_id = None
             if not success and "not found" not in str(err).lower():
-                return {"id": lead_id_airtable, "status": "Failed", "error": f"Delete Failed: {err}"}
+                return {"id": lead_id_airtable, "status": "Failed", "error": f"Delete Failed: {err}", **display_info}
     
     # =========================================================================
     # SCENARIO B: No instantly_lead_id or invalid (new sync)
@@ -219,7 +231,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
                     new_instantly_id = existing.get("id")
                     operation = "Link"
                 else:
-                    return {"id": lead_id_airtable, "status": "Failed", "error": f"Create Failed: {err}"}
+                    return {"id": lead_id_airtable, "status": "Failed", "error": f"Create Failed: {err}", **display_info}
             else:
                 # cnt == 0 but no error — lead already in this campaign (skipped)
                 existing, _ = search_lead_by_email(api_key, email, campaign_id=c_id, debug=debug_mode)
@@ -245,6 +257,7 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
         "op": operation,
         "new_instantly_id": new_instantly_id,
         "campaign_id": c_id if operation in ("Create", "Update", "Link") else None,
+        **display_info,
     }
 
 
@@ -256,9 +269,18 @@ def sync_pending_leads(
     debug_mode: bool,
     max_records: int = 5000,
     status,
+    verification_map: dict | None = None,
 ):
+    """Push pending leads to Instantly and write back results to the backend.
+
+    verification_map: optional {record_id -> verification_status} produced by
+    the MillionVerifier step in sync_with_verification. Used to enrich the
+    per-lead summary rows so operators can see both the MV verdict and the
+    Instantly outcome in one table.
+    """
     timestamp_now = pd.Timestamp.now(tz="UTC").isoformat()
     airtable_updates: list[dict] = []
+    verification_map = verification_map or {}
 
     reset_campaign_cache()
     status.write("📋 Loading existing campaigns...")
@@ -285,6 +307,10 @@ def sync_pending_leads(
         ]
         for future in as_completed(futures):
             res = future.result()
+            # Attach MillionVerifier verdict if available
+            rec_id = res.get("id")
+            if rec_id and rec_id in verification_map:
+                res["verification_status"] = verification_map[rec_id]
             results.append(res)
             completed += 1
 
@@ -293,9 +319,18 @@ def sync_pending_leads(
                 text=f"Processed {completed}/{total} leads",
             )
             if res.get("status") == "Success":
-                status.write(f"✅ {res.get('id')}: {res.get('op', 'Sync')}")
+                op = res.get("op", "Sync")
+                email = res.get("email") or "(no email)"
+                new_id = res.get("new_instantly_id") or "—"
+                if op in ("Create", "Update", "Link"):
+                    status.write(f"✅ {op}: {email} → {new_id[:8]}…")
+                elif op == "Delete":
+                    status.write(f"🗑️ {op}: {email}")
+                else:  # Skip
+                    status.write(f"⏭️ {op}: {email} (already in campaign / nothing to push)")
             else:
-                status.write(f"⚠️ {res.get('id')}: {res.get('error')}")
+                email = res.get("email") or res.get("id")
+                status.write(f"⚠️ Failed: {email} — {res.get('error')}")
 
     # 3. Process Results and Update Airtable
     success_count = 0
@@ -354,6 +389,43 @@ def sync_pending_leads(
             return {"error": "airtable_update_failed"}
     else:
         status.write("ℹ️ No updates to push to Airtable.")
+
+    # 5. Render per-lead summary table (inside the status expander so it's
+    #    visible during the run, and also saved via session_state for the
+    #    persistent "Last Sync Log" panel at the bottom of the page).
+    op_counter: Counter[str] = Counter()
+    table_rows: list[dict] = []
+    for res in results:
+        op_label = (
+            res.get("op")
+            if res.get("status") == "Success"
+            else "Failed"
+        ) or "Skip"
+        op_counter[op_label] += 1
+        new_id = res.get("new_instantly_id")
+        table_rows.append({
+            "op": op_label,
+            "email": res.get("email"),
+            "company": res.get("company_name"),
+            "industry": res.get("industry"),
+            "city": res.get("city"),
+            "verification": res.get("verification_status"),
+            "campaign": res.get("campaign_name"),
+            "instantly_id": (new_id[:8] + "…") if isinstance(new_id, str) and len(new_id) > 8 else new_id,
+            "error": res.get("error"),
+        })
+
+    if table_rows:
+        status.write("—")
+        status.write(f"📊 **Per-lead summary** ({total} leads)")
+        status.write(
+            "   ".join(f"{op}: {cnt}" for op, cnt in sorted(op_counter.items(), key=lambda kv: -kv[1]))
+        )
+        status.dataframe(
+            pd.DataFrame(table_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     status.update(label="✅ Sync Complete!", state="complete", expanded=False)
 
@@ -597,14 +669,19 @@ def sync_with_verification(
     good_api_verified_ids: list[str] = []  # Airtable IDs needing verification_status persisted
     skipped_leads: list[dict] = []  # unknown / inconclusive — leave alone
     bad_leads: list[tuple[dict, str]] = []  # (record, status)
+    # Per-record verification verdict map — passed into sync_pending_leads
+    # so the summary table can show both MV verdict + Instantly op in one row.
+    verification_map: dict[str, str] = {}
 
     for rec, v_status, was_api in verified:
+        rec_id = rec.get("id")
+        if rec_id:
+            verification_map[rec_id] = v_status
         if v_status in GOOD_STATUSES:
             good_leads.append(rec)
             if was_api:
-                airtable_id = rec.get("id")
-                if airtable_id:
-                    good_api_verified_ids.append(airtable_id)
+                if rec_id:
+                    good_api_verified_ids.append(rec_id)
         elif v_status in SKIP_STATUSES:
             skipped_leads.append(rec)
         else:
@@ -631,6 +708,7 @@ def sync_with_verification(
             debug_mode=debug_mode,
             max_records=max_records,
             status=status,
+            verification_map=verification_map,
         )
         if sync_result.get("error"):
             return sync_result  # propagate fatal Airtable error
@@ -665,16 +743,35 @@ def sync_with_verification(
 
     # ── Step 6: Merge results ────────────────────────────────────────────
     sync_details = sync_result.get("details", []) if sync_result else []
-    bad_details = [
-        {
+
+    # Build a map of bad leads' display info so the summary table can show
+    # their email/company/industry alongside the verification status.
+    bad_lead_info: dict = {}
+    for rec, _v_status in bad_leads:
+        rec_id = rec.get("id")
+        if not rec_id:
+            continue
+        email = rec.get("key_contact_email")
+        if isinstance(email, str):
+            email = email.strip().lower() or None
+        bad_lead_info[rec_id] = {
+            "email": email,
+            "company_name": rec.get("company_name"),
+            "industry": rec.get("industry"),
+            "city": rec.get("city"),
+        }
+
+    bad_details = []
+    for r in cleanup_result.get("details", []):
+        info = bad_lead_info.get(r["id"], {})
+        bad_details.append({
             "id": r["id"],
             "status": "Blocked",
             "op": "Blocked",
             "error": r.get("error"),
             "verification_status": r.get("verification_status"),
-        }
-        for r in cleanup_result.get("details", [])
-    ]
+            **info,
+        })
 
     all_details = sync_details + bad_details
 
