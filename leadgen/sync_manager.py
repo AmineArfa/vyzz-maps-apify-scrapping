@@ -90,8 +90,6 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
 
     lead_id_airtable = clean_data.get("id")
     lead_id_instantly = clean_data.get("instantly_lead_id")
-    email_avail = clean_data.get("email_available")
-    has_email_mark = str(email_avail) == "1" or email_avail is True
     email = clean_data.get("key_contact_email")
     if not isinstance(email, str) or not email.strip():
         clean_data["key_contact_email"] = None
@@ -99,6 +97,14 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
     else:
         email = email.strip().lower()
         clean_data["key_contact_email"] = email
+    # `email_available` is an Airtable-only field — Supabase backend never
+    # sets it. Derive the "has email" signal from the actual email value
+    # so both backends behave consistently. Previously: Supabase rows all
+    # fell through to the "no email → Skip" branch (B2 / A2), so the
+    # scraping app has never actually pushed a Supabase lead to Instantly
+    # since Step 3.3. Also accept the legacy Airtable marker if present.
+    email_avail = clean_data.get("email_available")
+    has_email_mark = bool(email) or str(email_avail) == "1" or email_avail is True
 
     industry = clean_data.get("industry")
     if not industry:
