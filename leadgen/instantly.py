@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 import threading
 
@@ -295,7 +297,7 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             api_key,
             campaign_id,
             variables=["postalCode", "jobTitle", "address", "City", "state",
-                       "competitor1", "competitor2", "competitor3", "lid"],
+                       "competitor1", "competitor2", "competitor3", "lid", "industry"],
             debug=debug,
         )
 
@@ -312,6 +314,9 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
 
         # Instantly v2 supports custom_variables for arbitrary metadata.
         # This is the safest way to store extra fields like postalCode/jobTitle/address/city/state.
+        industry_val = lead.get("industry")
+        if isinstance(industry_val, list):
+            industry_val = industry_val[0] if industry_val else None
         custom_variables = {
             "postalCode": lead.get("postal_code"),
             "jobTitle": lead.get("key_contact_position"),
@@ -321,6 +326,7 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             "competitor1": lead.get("competitor1"),
             "competitor2": lead.get("competitor2"),
             "competitor3": lead.get("competitor3"),
+            "industry": industry_val,
         }
         
         # Drop empty values to keep payload clean. Also drop NaNs (float) to avoid JSON errors or "nan" strings.
