@@ -132,6 +132,23 @@ class BuildWhereTests(unittest.TestCase):
         self.assertEqual(where, "industry = %s")
         self.assertEqual(params, ["'; DROP TABLE leads; --"])
 
+    def test_exclude_already_in_campaign_id(self):
+        # Recategorization passes the target campaign id so we don't even
+        # pull leads that are already there. Combines with NULL handling
+        # so leads with no campaign yet still come through.
+        target = "12345678-1234-1234-1234-123456789012"
+        where, params = build_where(
+            {"type": "ticket_tier", "value": "low"},
+            exclude_in_active_campaign=False,
+            exclude_already_in_campaign_id=target,
+        )
+        self.assertEqual(
+            where,
+            "ticket_tier = %s AND "
+            "(instantly_campaign_id IS NULL OR instantly_campaign_id <> %s)",
+        )
+        self.assertEqual(params, ["low", target])
+
     def test_describe_each_shape(self):
         self.assertEqual(
             describe({"type": "industry", "value": "Med Spa"}),

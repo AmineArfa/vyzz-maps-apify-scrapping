@@ -49,7 +49,7 @@ def _process_one(
 ) -> dict:
     """Process a single lead. Returns a result dict with op + status fields.
 
-    Operations: 'moved' | 'created' | 'skipped' | 'failed'.
+    Operations: 'moved' | 'created' | 'skipped' | 'failed' | 'already_in_place'.
 
     Side effect: when a lead is created, the returned `instantly_lead_id`
     field is set so the caller can write it back to raw.scraped_leads.
@@ -57,6 +57,7 @@ def _process_one(
     raw_id = lead.get("id")
     email = _normalize_email(lead.get("key_contact_email"))
     instantly_lead_id = lead.get("instantly_lead_id")
+    current_campaign_id = lead.get("instantly_campaign_id")
 
     base = {
         "id": raw_id,
@@ -66,6 +67,20 @@ def _process_one(
         "ticket_tier": lead.get("ticket_tier"),
         "instantly_lead_id": instantly_lead_id,
     }
+
+    # ── Already in target ────────────────────────────────────────────────
+    # Defensive: callers should already filter these out at SQL level (see
+    # build_where's `exclude_already_in_campaign_id`), but skip them here
+    # too so the recategorize loop is safe to retry without burning API
+    # calls on leads that are already where they should be.
+    if (
+        instantly_lead_id and is_valid_uuid(instantly_lead_id)
+        and current_campaign_id == campaign_id
+    ):
+        return {
+            **base, "op": "already_in_place",
+            "instantly_lead_id": instantly_lead_id, "error": None,
+        }
 
     # ── Move path ────────────────────────────────────────────────────────
     if instantly_lead_id and is_valid_uuid(instantly_lead_id):
@@ -157,7 +172,7 @@ def push_leads_to_campaign(
     if writeback:
         backend.batch_update(writeback)
 
-    counts = {"moved": 0, "created": 0, "skipped": 0, "failed": 0}
+    counts = {"moved": 0, "created": 0, "skipped": 0, "failed": 0, "already_in_place": 0}
     for r in results:
         counts[r["op"]] = counts.get(r["op"], 0) + 1
     counts["details"] = results
@@ -200,9 +215,19 @@ def recategorize_all_by_tier(
             continue
 
         spec = {"type": "ticket_tier", "value": tier}
-        leads = backend.fetch_leads_by_filter(
+        # SQL-level skip for leads already in the target campaign — keeps
+        # each iteration cheap so the operator can re-run the loop safely
+        # if a previous run was interrupted (network, rate limit, etc.).
+        total_in_tier = backend.count_leads_by_filter(
             spec, exclude_in_active_campaign=False,
         )
+        leads = backend.fetch_leads_by_filter(
+            spec,
+            exclude_in_active_campaign=False,
+            exclude_already_in_campaign_id=c_id,
+        )
+        already_in_place = max(total_in_tier - len(leads), 0)
+
         push_result = push_leads_to_campaign(
             backend, api_key=api_key, leads=leads,
             campaign_id=c_id, debug=debug, max_workers=max_workers,
@@ -210,9 +235,17 @@ def recategorize_all_by_tier(
         push_result["tier"] = tier
         push_result["campaign_id"] = c_id
         push_result["error"] = None
+        # SQL excluded these so they don't show up in details, but the
+        # operator should still see how many we left untouched.
+        push_result["already_in_place"] = (
+            push_result.get("already_in_place", 0) + already_in_place
+        )
         by_tier[tier] = push_result
 
-    aggregated = {"moved": 0, "created": 0, "skipped": 0, "failed": 0}
+    aggregated = {
+        "moved": 0, "created": 0, "skipped": 0, "failed": 0,
+        "already_in_place": 0,
+    }
     for r in by_tier.values():
         for k in aggregated:
             aggregated[k] += r.get(k, 0)

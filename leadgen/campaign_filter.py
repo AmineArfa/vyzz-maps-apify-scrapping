@@ -93,12 +93,19 @@ def build_where(
     spec: dict,
     *,
     exclude_in_active_campaign: bool = True,
+    exclude_already_in_campaign_id: str | None = None,
 ) -> tuple[str, list[Any]]:
     """Return a parameterized WHERE clause + params for `raw.scraped_leads`.
 
     The clause is composed with `AND`; callers prepend ``WHERE``. Identifiers
     are hard-coded — no user-supplied column names. Values are bound through
     psycopg2 placeholders, never string-formatted.
+
+    `exclude_already_in_campaign_id` lets a re-routing flow drop leads that
+    are already in the target campaign. We can't one-shot every push (network
+    hiccups, batch limits), so the recategorization is iterated; this clause
+    keeps each retry cheap and idempotent without touching leads that are
+    already where they should be.
     """
     spec = validate_filter_spec(spec)
     parts: list[str] = []
@@ -119,6 +126,12 @@ def build_where(
 
     if exclude_in_active_campaign:
         parts.append("instantly_campaign_id IS NULL")
+
+    if exclude_already_in_campaign_id:
+        parts.append(
+            "(instantly_campaign_id IS NULL OR instantly_campaign_id <> %s)"
+        )
+        params.append(exclude_already_in_campaign_id)
 
     return " AND ".join(parts), params
 

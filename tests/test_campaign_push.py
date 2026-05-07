@@ -151,6 +151,50 @@ class PushFlowTests(unittest.TestCase):
         self.assertEqual(backend.updates[0]["fields"]["instantly_lead_id"], found_id)
         self.assertEqual(backend.updates[0]["fields"]["instantly_campaign_id"], CAMPAIGN_ID)
 
+    def test_already_in_target_campaign_is_skipped_no_api_call(self):
+        # Defensive check: even if the SQL filter let one through, the
+        # push must not call /leads/move on a lead already in the target.
+        # Re-running the recategorization is then cheap and safe.
+        backend = _CapturingBackend()
+        existing_id = _uuid(20)
+        leads = [{
+            "id": "raw-already",
+            "key_contact_email": "x@y.com",
+            "instantly_lead_id": existing_id,
+            "instantly_campaign_id": CAMPAIGN_ID,  # already in target
+        }]
+        with patch.object(campaign_push, "move_lead_to_campaign") as m_move, \
+                patch.object(campaign_push, "export_leads_to_instantly") as m_create:
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+        m_move.assert_not_called()
+        m_create.assert_not_called()
+        self.assertEqual(result["already_in_place"], 1)
+        self.assertEqual(result["moved"], 0)
+        self.assertEqual(backend.updates, [])
+
+    def test_lead_in_different_campaign_is_moved(self):
+        # Same shape but the lead is in a *different* campaign — it must
+        # be moved into the target. The defensive skip only fires for an
+        # exact campaign-id match.
+        backend = _CapturingBackend()
+        existing_id = _uuid(21)
+        other_campaign = _uuid(99)
+        leads = [{
+            "id": "raw-elsewhere",
+            "key_contact_email": "x@y.com",
+            "instantly_lead_id": existing_id,
+            "instantly_campaign_id": other_campaign,
+        }]
+        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)) as m_move:
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+        m_move.assert_called_once()
+        self.assertEqual(result["moved"], 1)
+        self.assertEqual(result["already_in_place"], 0)
+
     def test_failed_move_does_not_writeback(self):
         backend = _CapturingBackend()
         existing_id = _uuid(5)
@@ -197,13 +241,30 @@ class PushFlowTests(unittest.TestCase):
 class RecategorizeAllTests(unittest.TestCase):
     """recategorize_all_by_tier loops the three tiers and aggregates."""
 
-    def _make_backend(self, leads_by_tier):
-        captured = {"updates": [], "fetched": []}
+    def _make_backend(self, leads_by_tier, total_by_tier=None):
+        captured = {"updates": [], "fetched": [], "counted": []}
+        totals = total_by_tier or {t: len(v) for t, v in leads_by_tier.items()}
 
         class _B:
-            def fetch_leads_by_filter(self, spec, *, limit=None, exclude_in_active_campaign=True):
-                captured["fetched"].append((spec, exclude_in_active_campaign))
+            def fetch_leads_by_filter(
+                self, spec, *, limit=None,
+                exclude_in_active_campaign=True,
+                exclude_already_in_campaign_id=None,
+            ):
+                captured["fetched"].append({
+                    "spec": spec,
+                    "exclude_active": exclude_in_active_campaign,
+                    "exclude_target": exclude_already_in_campaign_id,
+                })
                 return list(leads_by_tier.get(spec["value"], []))
+
+            def count_leads_by_filter(
+                self, spec, *,
+                exclude_in_active_campaign=True,
+                exclude_already_in_campaign_id=None,
+            ):
+                captured["counted"].append(spec)
+                return totals.get(spec["value"], 0)
 
             def batch_update(self, updates):
                 captured["updates"].extend(updates)
@@ -230,13 +291,18 @@ class RecategorizeAllTests(unittest.TestCase):
             )
 
         # All three tier filters were applied.
-        seen_specs = [s for s, _ in captured["fetched"]]
+        seen_specs = [f["spec"] for f in captured["fetched"]]
         self.assertEqual(
             sorted(s["value"] for s in seen_specs),
             ["high", "low", "mid"],
         )
-        # Each filter call disabled exclude_in_active_campaign.
-        self.assertTrue(all(not excl for _, excl in captured["fetched"]))
+        # Each fetch disabled exclude_in_active_campaign...
+        self.assertTrue(all(not f["exclude_active"] for f in captured["fetched"]))
+        # ...and passed the resolved campaign id as exclude_already_in_campaign_id
+        # so leads already in the right tier campaign are dropped at SQL level.
+        for f in captured["fetched"]:
+            tier = f["spec"]["value"]
+            self.assertEqual(f["exclude_target"], camp_ids[tier])
 
         self.assertEqual(result["moved"], 3)
         self.assertEqual(result["created"], 0)
@@ -245,6 +311,33 @@ class RecategorizeAllTests(unittest.TestCase):
         for tier, c_id in camp_ids.items():
             self.assertEqual(result["by_tier"][tier]["campaign_id"], c_id)
             self.assertEqual(result["by_tier"][tier]["moved"], 1)
+
+    def test_reports_already_in_place_per_tier(self):
+        # Total in tier reported by count == 5; SQL-filtered fetch returns 2.
+        # The orchestrator must report 3 already_in_place for that tier.
+        leads_by_tier = {
+            "low": [
+                {"id": "l1", "key_contact_email": "a@x.com", "instantly_lead_id": _uuid(30)},
+                {"id": "l2", "key_contact_email": "b@x.com", "instantly_lead_id": _uuid(31)},
+            ],
+            "mid": [],
+            "high": [],
+        }
+        totals = {"low": 5, "mid": 0, "high": 0}
+        backend, _ = self._make_backend(leads_by_tier, total_by_tier=totals)
+        camp_ids = {"low": _uuid(40), "mid": _uuid(41), "high": _uuid(42)}
+
+        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)):
+            result = campaign_push.recategorize_all_by_tier(
+                backend, api_key="k",
+                resolve_campaign_id=lambda t: camp_ids[t],
+                max_workers=1,
+            )
+
+        self.assertEqual(result["moved"], 2)
+        self.assertEqual(result["already_in_place"], 3)
+        self.assertEqual(result["by_tier"]["low"]["already_in_place"], 3)
+        self.assertEqual(result["by_tier"]["low"]["moved"], 2)
 
     def test_unresolved_campaign_records_error_does_not_block_others(self):
         # If a tier's campaign can't be resolved, we record the error but

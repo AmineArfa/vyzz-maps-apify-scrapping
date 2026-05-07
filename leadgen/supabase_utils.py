@@ -408,10 +408,13 @@ def count_leads_by_filter_sb(
     filter_spec: dict,
     *,
     exclude_in_active_campaign: bool = True,
+    exclude_already_in_campaign_id: str | None = None,
 ) -> int:
     """Count `raw.scraped_leads` matching filter_spec."""
     where, params = build_filter_where(
-        filter_spec, exclude_in_active_campaign=exclude_in_active_campaign
+        filter_spec,
+        exclude_in_active_campaign=exclude_in_active_campaign,
+        exclude_already_in_campaign_id=exclude_already_in_campaign_id,
     )
     try:
         with conn.cursor() as cur:
@@ -430,10 +433,13 @@ def fetch_leads_by_filter_sb(
     *,
     limit: int | None = None,
     exclude_in_active_campaign: bool = True,
+    exclude_already_in_campaign_id: str | None = None,
 ) -> list[dict]:
     """Return leads matching filter_spec. Caller controls `limit` (None = all)."""
     where, params = build_filter_where(
-        filter_spec, exclude_in_active_campaign=exclude_in_active_campaign
+        filter_spec,
+        exclude_in_active_campaign=exclude_in_active_campaign,
+        exclude_already_in_campaign_id=exclude_already_in_campaign_id,
     )
     cols = ", ".join(_SAMPLE_COLUMNS)
     sql = f"SELECT {cols} FROM raw.scraped_leads WHERE {where} ORDER BY company_name"
@@ -542,10 +548,17 @@ class SupabaseBackend:
     def count_leads_without_tier(self) -> int:
         return count_leads_without_tier_sb(self.conn)
 
-    def count_leads_by_filter(self, filter_spec: dict, *, exclude_in_active_campaign: bool = True) -> int:
+    def count_leads_by_filter(
+        self,
+        filter_spec: dict,
+        *,
+        exclude_in_active_campaign: bool = True,
+        exclude_already_in_campaign_id: str | None = None,
+    ) -> int:
         return count_leads_by_filter_sb(
             self.conn, filter_spec,
             exclude_in_active_campaign=exclude_in_active_campaign,
+            exclude_already_in_campaign_id=exclude_already_in_campaign_id,
         )
 
     def fetch_leads_by_filter(
@@ -554,10 +567,12 @@ class SupabaseBackend:
         *,
         limit: int | None = None,
         exclude_in_active_campaign: bool = True,
+        exclude_already_in_campaign_id: str | None = None,
     ) -> list[dict]:
         return fetch_leads_by_filter_sb(
             self.conn, filter_spec, limit=limit,
             exclude_in_active_campaign=exclude_in_active_campaign,
+            exclude_already_in_campaign_id=exclude_already_in_campaign_id,
         )
 
     def create_campaign_record(
