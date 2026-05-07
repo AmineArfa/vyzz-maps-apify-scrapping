@@ -217,22 +217,29 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
                         created_by=operator,
                     )
 
-        cols = st.columns(4)
+        cols = st.columns(5)
         cols[0].metric("Moved", result["moved"])
         cols[1].metric("Created", result["created"])
-        cols[2].metric("Skipped", result["skipped"])
-        cols[3].metric("Failed", result["failed"])
+        cols[2].metric("Already in place", result.get("already_in_place", 0))
+        cols[3].metric("Skipped", result["skipped"])
+        cols[4].metric("Failed", result["failed"])
 
         per_tier_rows = [{
             "tier": t,
             "campaign": tier_names[t],
             "moved": result["by_tier"][t].get("moved", 0),
             "created": result["by_tier"][t].get("created", 0),
+            "already_in_place": result["by_tier"][t].get("already_in_place", 0),
             "skipped": result["by_tier"][t].get("skipped", 0),
             "failed": result["by_tier"][t].get("failed", 0),
             "error": result["by_tier"][t].get("error") or "",
         } for t in TIERS]
         st.dataframe(pd.DataFrame(per_tier_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "ℹ️ `already_in_place` rows were skipped at the SQL filter — leads "
+            "already in the right tier campaign aren't re-moved. Safe to re-run "
+            "this if a previous attempt was interrupted."
+        )
 
         if result["failed"]:
             failures = [
@@ -357,11 +364,12 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
             )
 
         if result.get("ok"):
-            cols = st.columns(4)
+            cols = st.columns(5)
             cols[0].metric("Moved", result.get("moved", 0))
             cols[1].metric("Created", result.get("created", 0))
-            cols[2].metric("Skipped", result.get("skipped", 0))
-            cols[3].metric("Failed", result.get("failed", 0))
+            cols[2].metric("Already in place", result.get("already_in_place", 0))
+            cols[3].metric("Skipped", result.get("skipped", 0))
+            cols[4].metric("Failed", result.get("failed", 0))
             st.success(
                 f"Pushed to Instantly campaign `{result['instantly_campaign_id']}`. "
                 f"Filter recorded as `raw.campaigns.id = {result['campaign_record_id']}`."
