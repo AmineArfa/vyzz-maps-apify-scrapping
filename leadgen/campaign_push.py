@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .instantly import (
+    bulk_move_leads_to_campaign,
     export_leads_to_instantly,
     inject_lid_to_lead,
     is_valid_uuid,
@@ -31,6 +32,16 @@ from .instantly import (
     search_lead_by_email,
 )
 from .ticket_tier import TIERS
+
+
+import time
+
+# Conservative chunk size + inter-chunk delay. Empirically 100/call hit
+# Instantly's rate limiter under heavy throughput, dropping whole chunks
+# silently. 50 + 250ms throttle keeps us comfortably under the limit and
+# the SQL filter on re-runs absorbs any chunks that still fail.
+_BULK_MOVE_CHUNK = 50
+_BULK_MOVE_THROTTLE_SEC = 0.25
 
 
 def _normalize_email(value: Any) -> str | None:
@@ -120,6 +131,44 @@ def _process_one(
     return {**base, "op": "failed", "error": "create returned 0 leads, search found nothing"}
 
 
+def _base_for(lead: dict) -> dict:
+    return {
+        "id": lead.get("id"),
+        "email": _normalize_email(lead.get("key_contact_email")),
+        "company_name": lead.get("company_name"),
+        "industry": lead.get("industry"),
+        "ticket_tier": lead.get("ticket_tier"),
+        "instantly_lead_id": lead.get("instantly_lead_id"),
+    }
+
+
+def _classify(leads: list[dict], campaign_id: str) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Split leads into buckets: already_in_place, to_move, to_create, skipped.
+
+    Pure function; the SQL filter normally drops `already_in_place` upstream
+    but the defensive split keeps the push correct if a caller passes stale
+    rows.
+    """
+    already, to_move, to_create, skipped = [], [], [], []
+    for lead in leads:
+        instantly_lead_id = lead.get("instantly_lead_id")
+        current_campaign_id = lead.get("instantly_campaign_id")
+        email = _normalize_email(lead.get("key_contact_email"))
+
+        if (
+            instantly_lead_id and is_valid_uuid(instantly_lead_id)
+            and current_campaign_id == campaign_id
+        ):
+            already.append(lead)
+        elif instantly_lead_id and is_valid_uuid(instantly_lead_id):
+            to_move.append(lead)
+        elif email:
+            to_create.append(lead)
+        else:
+            skipped.append(lead)
+    return already, to_move, to_create, skipped
+
+
 def push_leads_to_campaign(
     backend,
     *,
@@ -128,38 +177,66 @@ def push_leads_to_campaign(
     campaign_id: str,
     debug: bool = False,
     max_workers: int = 5,
+    on_progress=None,
 ) -> dict:
-    """Push `leads` into Instantly `campaign_id` and write back the resulting ids.
+    """Push `leads` into Instantly `campaign_id` and write back the ids.
 
-    Returns:
-        {
-            "moved": int,
-            "created": int,
-            "skipped": int,
-            "failed": int,
-            "details": [ <per-lead result dict>, ... ],
-        }
+    Two-phase strategy:
+      1. Pre-classify into already_in_place / to_move / to_create / skipped.
+      2. Bulk-move existing leads in chunks of ~100 — one /leads/move call
+         per chunk preserves lid + every other custom variable while cutting
+         API call count by ~100x compared to per-lead PATCH.
+      3. Per-lead create + writeback for new leads (the writeback is per-lead
+         because the new id needs to land back in raw.scraped_leads
+         regardless of batch outcome).
+
+    `on_progress(done, total, phase)` is called after each meaningful step
+    so the UI can refresh a status line / progress bar. Phases are
+    'classify', 'move', 'create'.
+
+    Returns the same shape as before: {moved, created, skipped,
+    already_in_place, failed, details: [ ... ]}.
     """
     if not leads:
-        return {"moved": 0, "created": 0, "skipped": 0, "failed": 0, "details": []}
+        return {
+            "moved": 0, "created": 0, "skipped": 0, "failed": 0,
+            "already_in_place": 0, "details": [],
+        }
 
+    total = len(leads)
     results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [
-            ex.submit(_process_one, lead, api_key=api_key, campaign_id=campaign_id, debug=debug)
-            for lead in leads
-        ]
-        for fut in as_completed(futures):
-            results.append(fut.result())
-
-    # ── Write back instantly_lead_id / instantly_campaign_id ─────────────
-    # For 'moved' and 'created' rows. We always set instantly_campaign_id
-    # to the target so the raw view stays in sync with Instantly's truth.
     now_iso = datetime.now(timezone.utc).isoformat()
-    writeback: list[dict] = []
-    for r in results:
+
+    def _progress(done: int, phase: str) -> None:
+        if on_progress is not None:
+            try:
+                on_progress(done, total, phase)
+            except Exception:
+                pass
+
+    already, to_move, to_create, skipped = _classify(leads, campaign_id)
+    _progress(0, "classify")
+
+    # ── Already in place ─────────────────────────────────────────────────
+    for lead in already:
+        results.append({
+            **_base_for(lead),
+            "op": "already_in_place",
+            "error": None,
+        })
+
+    def _writeback_one(r: dict) -> None:
+        """Flush a single lead writeback immediately to raw.scraped_leads.
+
+        Critical invariant: a successful Instantly create or move MUST be
+        persisted before we move on to the next operation. Buffering
+        writebacks in memory and flushing only at the end (the previous
+        design) loses everything if the run is interrupted — the lead
+        exists server-side (consuming plan capacity) but raw never knows,
+        and re-runs can't deduplicate it.
+        """
         if r["op"] in ("moved", "created") and r.get("id") and r.get("instantly_lead_id"):
-            writeback.append({
+            backend.batch_update([{
                 "id": r["id"],
                 "fields": {
                     "instantly_lead_id": r["instantly_lead_id"],
@@ -167,16 +244,180 @@ def push_leads_to_campaign(
                     "instantly_statuts": "Success",
                     "last_synced_at": now_iso,
                 },
-            })
+            }])
 
-    if writeback:
-        backend.batch_update(writeback)
+    # ── Bulk move existing leads in chunks ───────────────────────────────
+    moved_done = 0
+    for i in range(0, len(to_move), _BULK_MOVE_CHUNK):
+        chunk = to_move[i : i + _BULK_MOVE_CHUNK]
+        ids = [l["instantly_lead_id"] for l in chunk]
+        if i > 0 and _BULK_MOVE_THROTTLE_SEC > 0:
+            time.sleep(_BULK_MOVE_THROTTLE_SEC)
+        ok, err = bulk_move_leads_to_campaign(api_key, ids, campaign_id, debug=debug)
+        if ok:
+            # Per-chunk writeback BEFORE moving to the next chunk so a
+            # mid-loop crash leaves earlier chunks durably persisted.
+            chunk_writeback = []
+            for lead in chunk:
+                results.append({
+                    **_base_for(lead), "op": "moved", "error": None,
+                })
+                chunk_writeback.append({
+                    "id": lead["id"],
+                    "fields": {
+                        "instantly_lead_id": lead["instantly_lead_id"],
+                        "instantly_campaign_id": campaign_id,
+                        "instantly_statuts": "Success",
+                        "last_synced_at": now_iso,
+                    },
+                })
+            if chunk_writeback:
+                backend.batch_update(chunk_writeback)
+            moved_done += len(chunk)
+        else:
+            # Bulk failed — fall back to per-lead so we record granular
+            # success/failure instead of failing the whole chunk.
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = [
+                    ex.submit(_process_one, lead, api_key=api_key,
+                              campaign_id=campaign_id, debug=debug)
+                    for lead in chunk
+                ]
+                for fut in as_completed(futures):
+                    r = fut.result()
+                    results.append(r)
+                    _writeback_one(r)
+            moved_done += len(chunk)
+        _progress(len(already) + moved_done, "move")
+
+    # ── Per-lead create with immediate writeback ─────────────────────────
+    create_done = 0
+    if to_create:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(
+                    _process_one, lead, api_key=api_key,
+                    campaign_id=campaign_id, debug=debug,
+                ): lead
+                for lead in to_create
+            }
+            for fut in as_completed(futures):
+                r = fut.result()
+                results.append(r)
+                # IMMEDIATELY persist the new instantly_lead_id back to raw
+                # so a subsequent crash never leaves an orphaned Instantly
+                # lead that raw doesn't know about.
+                _writeback_one(r)
+                create_done += 1
+                _progress(len(already) + len(to_move) + create_done, "create")
+
+    # ── No-email skips ───────────────────────────────────────────────────
+    for lead in skipped:
+        results.append({
+            **_base_for(lead), "op": "skipped", "error": "no email",
+        })
 
     counts = {"moved": 0, "created": 0, "skipped": 0, "failed": 0, "already_in_place": 0}
     for r in results:
         counts[r["op"]] = counts.get(r["op"], 0) + 1
     counts["details"] = results
     return counts
+
+
+def reconcile_unlinked_leads(
+    backend,
+    *,
+    api_key: str,
+    debug: bool = False,
+    max_workers: int = 5,
+    limit: int | None = None,
+    on_progress=None,
+) -> dict:
+    """Recover leads whose Instantly create succeeded but writeback was lost.
+
+    For each raw row with `instantly_lead_id IS NULL` and a real email,
+    search Instantly by email. If found, write the existing lead id back
+    so subsequent runs treat the row as MOVE-eligible (not CREATE-eligible),
+    avoiding duplicates and reclaiming visibility into Instantly state.
+
+    Returns:
+        {
+            "scanned": int,
+            "linked": int,
+            "not_found": int,
+            "errored": int,
+            "details": [ { id, email, found_id, found_campaign, error } ],
+        }
+    """
+    candidates = backend.fetch_unlinked_leads_with_email(limit=limit)
+    total = len(candidates)
+    if not total:
+        return {"scanned": 0, "linked": 0, "not_found": 0, "errored": 0, "details": []}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    linked = 0
+    not_found = 0
+    errored = 0
+    details: list[dict] = []
+
+    def _one(lead: dict) -> dict:
+        raw_id = lead.get("id")
+        email = _normalize_email(lead.get("key_contact_email"))
+        if not email:
+            return {"id": raw_id, "email": None, "found_id": None, "error": "no email"}
+        found, err = search_lead_by_email(api_key, email, debug=debug)
+        if found and found.get("id") and is_valid_uuid(found["id"]):
+            return {
+                "id": raw_id, "email": email,
+                "found_id": found["id"],
+                "found_campaign": found.get("campaign"),
+                "error": None,
+            }
+        return {
+            "id": raw_id, "email": email,
+            "found_id": None, "found_campaign": None,
+            "error": err,
+        }
+
+    processed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_one, l): l for l in candidates}
+        for fut in as_completed(futures):
+            r = fut.result()
+            processed += 1
+            details.append(r)
+            if r.get("found_id"):
+                # Immediate writeback — same crash-safety principle as the
+                # main push: never let an Instantly identity sit unlinked
+                # in raw if we already know about it.
+                fields = {
+                    "instantly_lead_id": r["found_id"],
+                    "last_synced_at": now_iso,
+                }
+                if r.get("found_campaign"):
+                    fields["instantly_campaign_id"] = r["found_campaign"]
+                ok = backend.batch_update([{"id": r["id"], "fields": fields}])
+                if ok:
+                    linked += 1
+                else:
+                    errored += 1
+            elif r.get("error"):
+                errored += 1
+            else:
+                not_found += 1
+            if on_progress is not None:
+                try:
+                    on_progress(processed, total)
+                except Exception:
+                    pass
+
+    return {
+        "scanned": total,
+        "linked": linked,
+        "not_found": not_found,
+        "errored": errored,
+        "details": details,
+    }
 
 
 def recategorize_all_by_tier(
@@ -186,6 +427,8 @@ def recategorize_all_by_tier(
     resolve_campaign_id,
     debug: bool = False,
     max_workers: int = 5,
+    on_tier_start=None,
+    on_progress=None,
 ) -> dict:
     """One-click: re-route every lead in raw.scraped_leads into its tier campaign.
 
@@ -228,9 +471,23 @@ def recategorize_all_by_tier(
         )
         already_in_place = max(total_in_tier - len(leads), 0)
 
+        if on_tier_start is not None:
+            try:
+                on_tier_start(tier, len(leads), already_in_place, c_id)
+            except Exception:
+                pass
+
+        def _tier_progress(done: int, total: int, phase: str) -> None:
+            if on_progress is not None:
+                try:
+                    on_progress(tier, done, total, phase)
+                except Exception:
+                    pass
+
         push_result = push_leads_to_campaign(
             backend, api_key=api_key, leads=leads,
             campaign_id=c_id, debug=debug, max_workers=max_workers,
+            on_progress=_tier_progress,
         )
         push_result["tier"] = tier
         push_result["campaign_id"] = c_id

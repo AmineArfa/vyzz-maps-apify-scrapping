@@ -612,6 +612,49 @@ def inject_lid_to_lead(api_key, lead_id, debug=False):
     return False, f"Failed to inject lid: {update_err}"
 
 
+def bulk_move_leads_to_campaign(api_key, lead_ids, campaign_id, debug=False):
+    """Move many leads at once via Instantly's bulk move endpoint.
+
+    `POST /api/v2/leads/move` accepts a list of ids and reassigns them
+    all to `to_campaign_id` server-side. Custom variables (`lid`, industry,
+    ticket_tier, etc.) are preserved — the call only changes campaign
+    membership. Returns (success: bool, error: str | None).
+
+    Caller is responsible for chunking. Empirically Instantly accepts at
+    least 100 ids per call comfortably; larger payloads risk 413/timeout.
+    """
+    if not api_key or not lead_ids or not campaign_id:
+        return False, "Missing api_key, lead_ids, or campaign_id"
+    if not is_valid_uuid(campaign_id):
+        return False, f"Invalid campaign_id format: {campaign_id}"
+
+    valid_ids = [lid for lid in lead_ids if isinstance(lid, str) and is_valid_uuid(lid)]
+    if not valid_ids:
+        return False, "No valid lead UUIDs in batch"
+
+    url = f"{BASE_URL}/api/v2/leads/move"
+    headers = _headers(api_key)
+    payload = {"ids": valid_ids, "to_campaign_id": campaign_id}
+
+    try:
+        resp = _request_with_retry(
+            "POST", url, headers=headers, json_payload=payload, timeout=30,
+        )
+        if 200 <= resp.status_code < 300:
+            if debug:
+                st.write(f"➡️ Bulk-moved {len(valid_ids)} leads → {campaign_id[:8]}…")
+            return True, None
+        err = f"Bulk move failed: {resp.status_code} - {resp.text[:200]}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
+    except Exception as e:
+        err = f"Bulk move exception: {e}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
+
+
 def move_lead_to_campaign(api_key, lead_id, campaign_id, debug=False):
     """Move an existing Instantly lead into `campaign_id`. Idempotent.
 
