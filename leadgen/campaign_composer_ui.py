@@ -255,23 +255,59 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+def _render_recorded_campaigns(backend) -> None:
+    st.subheader("📚 Recorded campaigns")
+    records = backend.list_campaign_records()
+    if not records:
+        st.caption("No campaigns recorded yet.")
+        return
+    rows = []
+    for r in records:
+        rows.append({
+            "name": r.get("name"),
+            "filter": describe(r["filter_spec"]) if r.get("filter_spec") else "—",
+            "status": r.get("status"),
+            "instantly_campaign_id": (
+                (r["instantly_campaign_id"][:8] + "…")
+                if r.get("instantly_campaign_id") else "—"
+            ),
+            "created_by": r.get("created_by") or "—",
+            "created_at": r.get("created_at"),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
 def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> None:
     st.subheader("📣 Campaign Composer")
     st.caption(
-        "Segment `raw.scraped_leads` by industry and/or ticket_tier, then "
-        "create a new Instantly campaign or move the matched leads into an "
-        "existing one. The filter is saved on `raw.campaigns.filter_spec`."
+        "Two flows: a one-click bulk recategorization that routes every lead "
+        "into its tier campaign, and a single-segment picker for ad-hoc pushes."
     )
 
     if active_mode != "supabase":
         st.info("Campaign composer requires the Supabase backend.")
         return
 
+    # ── 1. Bulk recategorization (always visible) ────────────────────────
+    _render_recategorize_section(backend, secrets, debug_mode)
+    st.divider()
+
+    # ── 2. Single-segment picker (ad-hoc) ────────────────────────────────
+    st.subheader("🎯 Push a single segment")
+    st.caption(
+        "Pick an industry and/or tier to push just that slice into a new or "
+        "existing Instantly campaign. The filter is saved on `raw.campaigns.filter_spec`."
+    )
+
     industry, tier, exclude_active = _render_filter_picker(backend)
     spec, picker_err = _spec_from_inputs(industry, tier)
 
     if picker_err:
-        st.error(picker_err)
+        # Soft notice instead of an early return so the recorded-campaigns
+        # list (and the recategorize section above) stay visible.
+        st.info(picker_err)
+        st.divider()
+        _render_recorded_campaigns(backend)
         return
 
     assert spec is not None  # for type checker
@@ -283,6 +319,8 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
 
     if count == 0:
         st.info("No leads match this filter.")
+        st.divider()
+        _render_recorded_campaigns(backend)
         return
 
     sample = backend.fetch_leads_by_filter(
@@ -400,25 +438,4 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
             st.error(f"❌ {result.get('error')}")
 
     st.divider()
-    _render_recategorize_section(backend, secrets, debug_mode)
-
-    st.divider()
-    st.subheader("📚 Recorded campaigns")
-    records = backend.list_campaign_records()
-    if not records:
-        st.caption("No campaigns recorded yet.")
-        return
-    rows = []
-    for r in records:
-        rows.append({
-            "name": r.get("name"),
-            "filter": describe(r["filter_spec"]) if r.get("filter_spec") else "—",
-            "status": r.get("status"),
-            "instantly_campaign_id": (
-                (r["instantly_campaign_id"][:8] + "…")
-                if r.get("instantly_campaign_id") else "—"
-            ),
-            "created_by": r.get("created_by") or "—",
-            "created_at": r.get("created_at"),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    _render_recorded_campaigns(backend)
