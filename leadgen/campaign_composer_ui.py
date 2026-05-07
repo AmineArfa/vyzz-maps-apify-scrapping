@@ -149,33 +149,71 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
         key="recat_name_template",
     )
 
-    tier_counts: dict[str, int] = {}
+    # Build per-tier names. Format errors fall back to the default template
+    # rather than blanking the section, so a stray brace in the input box
+    # never makes the run button disappear.
     tier_names: dict[str, str] = {}
     for tier in TIERS:
-        tier_counts[tier] = backend.count_leads_by_filter(
-            {"type": "ticket_tier", "value": tier},
-            exclude_in_active_campaign=False,
-        )
         try:
             tier_names[tier] = name_template.format(
                 tier=tier, tier_title=tier.title(),
             )
-        except (KeyError, IndexError):
-            st.error("Template must use only `{tier}` and `{tier_title}`.")
-            return
+        except (KeyError, IndexError, ValueError):
+            tier_names[tier] = f"{tier.title()} Tier - Cold Outreach"
+            st.warning(
+                f"Template error for `{tier}`. Falling back to "
+                f"`{tier_names[tier]}`. Use only `{{tier}}` and `{{tier_title}}`."
+            )
 
-    tier_less = backend.count_leads_without_tier()
+    # Per-tier counts. Each query is wrapped so a Postgres error in one
+    # tier doesn't blank the whole section — the operator still sees the
+    # other tiers and can re-try.
+    tier_counts: dict[str, int] = {}
+    counts_errored = False
+    with st.spinner("Counting leads per tier…"):
+        for tier in TIERS:
+            try:
+                tier_counts[tier] = backend.count_leads_by_filter(
+                    {"type": "ticket_tier", "value": tier},
+                    exclude_in_active_campaign=False,
+                )
+            except Exception as e:
+                tier_counts[tier] = 0
+                counts_errored = True
+                st.error(f"Could not count `{tier}` leads: {e}")
 
-    preview_rows = [{
-        "tier": t,
-        "count": tier_counts[t],
-        "campaign": tier_names[t],
-    } for t in TIERS]
-    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+    try:
+        tier_less = backend.count_leads_without_tier()
+    except Exception as e:
+        tier_less = 0
+        st.warning(f"Could not count tier-less leads: {e}")
+
+    # Force every tier to render as a metric so the operator visually
+    # confirms the section is alive, even if the DB returned zeros.
+    cols = st.columns(len(TIERS) + 1)
+    for i, tier in enumerate(TIERS):
+        cols[i].metric(
+            label=f"{tier.title()} → {tier_names[tier]}",
+            value=int(tier_counts.get(tier, 0)),
+        )
+    cols[-1].metric(label="No tier (skipped)", value=int(tier_less))
+
     if tier_less:
         st.caption(
             f"⚠️ {tier_less} leads have NULL `ticket_tier` and won't be "
             "recategorized. Set their `industry` to populate the tier first."
+        )
+
+    if counts_errored:
+        st.error(
+            "One or more tier counts failed. The button stays available so "
+            "you can still attempt the run, but expect the same error to "
+            "surface during the push."
+        )
+    elif sum(tier_counts.values()) == 0:
+        st.info(
+            "No leads to recategorize — every lead with a `ticket_tier` is "
+            "already in its target campaign, or the column is unset."
         )
 
     confirmed = st.checkbox(
@@ -186,7 +224,7 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
     if st.button(
         "🚀 Run recategorization",
         type="primary",
-        disabled=not confirmed or sum(tier_counts.values()) == 0,
+        disabled=not confirmed,
         key="recat_run_btn",
     ):
         api_key = secrets.get("instantly_key")
