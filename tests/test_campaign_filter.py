@@ -89,12 +89,16 @@ class SpecFromPickerTests(unittest.TestCase):
 
 
 class BuildWhereTests(unittest.TestCase):
+    # build_where now always appends `excluded_at IS NULL` so soft-deleted
+    # rows never come through any filter path.
+    _EXCLUDED_TAIL = " AND excluded_at IS NULL"
+
     def test_industry_filter_sql(self):
         where, params = build_where(
             {"type": "industry", "value": "Med Spa"},
             exclude_in_active_campaign=False,
         )
-        self.assertEqual(where, "industry = %s")
+        self.assertEqual(where, "industry = %s" + self._EXCLUDED_TAIL)
         self.assertEqual(params, ["Med Spa"])
 
     def test_ticket_tier_filter_sql(self):
@@ -102,7 +106,7 @@ class BuildWhereTests(unittest.TestCase):
             {"type": "ticket_tier", "value": "low"},
             exclude_in_active_campaign=False,
         )
-        self.assertEqual(where, "ticket_tier = %s")
+        self.assertEqual(where, "ticket_tier = %s" + self._EXCLUDED_TAIL)
         self.assertEqual(params, ["low"])
 
     def test_combined_filter_sql(self):
@@ -110,7 +114,10 @@ class BuildWhereTests(unittest.TestCase):
             {"type": "industry_and_tier", "industry": "Med Spa", "tier": "low"},
             exclude_in_active_campaign=False,
         )
-        self.assertEqual(where, "industry = %s AND ticket_tier = %s")
+        self.assertEqual(
+            where,
+            "industry = %s AND ticket_tier = %s" + self._EXCLUDED_TAIL,
+        )
         self.assertEqual(params, ["Med Spa", "low"])
 
     def test_exclude_active_campaign_appends_clause(self):
@@ -118,7 +125,11 @@ class BuildWhereTests(unittest.TestCase):
             {"type": "industry", "value": "Med Spa"},
             exclude_in_active_campaign=True,
         )
-        self.assertEqual(where, "industry = %s AND instantly_campaign_id IS NULL")
+        self.assertEqual(
+            where,
+            "industry = %s AND instantly_campaign_id IS NULL"
+            + self._EXCLUDED_TAIL,
+        )
         # No new params — IS NULL is parameter-free.
         self.assertEqual(params, ["Med Spa"])
 
@@ -129,13 +140,10 @@ class BuildWhereTests(unittest.TestCase):
             {"type": "industry", "value": "'; DROP TABLE leads; --"},
             exclude_in_active_campaign=False,
         )
-        self.assertEqual(where, "industry = %s")
+        self.assertEqual(where, "industry = %s" + self._EXCLUDED_TAIL)
         self.assertEqual(params, ["'; DROP TABLE leads; --"])
 
     def test_exclude_already_in_campaign_id(self):
-        # Recategorization passes the target campaign id so we don't even
-        # pull leads that are already there. Combines with NULL handling
-        # so leads with no campaign yet still come through.
         target = "12345678-1234-1234-1234-123456789012"
         where, params = build_where(
             {"type": "ticket_tier", "value": "low"},
@@ -145,9 +153,18 @@ class BuildWhereTests(unittest.TestCase):
         self.assertEqual(
             where,
             "ticket_tier = %s AND "
-            "(instantly_campaign_id IS NULL OR instantly_campaign_id <> %s)",
+            "(instantly_campaign_id IS NULL OR instantly_campaign_id <> %s)"
+            + self._EXCLUDED_TAIL,
         )
         self.assertEqual(params, ["low", target])
+
+    def test_excluded_rows_always_filtered(self):
+        # Confirm the tail is appended even with all toggles off.
+        where, _ = build_where(
+            {"type": "industry", "value": "Med Spa"},
+            exclude_in_active_campaign=False,
+        )
+        self.assertTrue(where.endswith(self._EXCLUDED_TAIL))
 
     def test_describe_each_shape(self):
         self.assertEqual(

@@ -133,6 +133,10 @@ def build_where(
         )
         params.append(exclude_already_in_campaign_id)
 
+    # Soft-deleted (excluded) rows are universally invisible to downstream
+    # flows — sync, recategorize, segment-push, count helpers all skip them.
+    parts.append("excluded_at IS NULL")
+
     return " AND ".join(parts), params
 
 

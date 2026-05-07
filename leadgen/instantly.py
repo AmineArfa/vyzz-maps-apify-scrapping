@@ -612,6 +612,81 @@ def inject_lid_to_lead(api_key, lead_id, debug=False):
     return False, f"Failed to inject lid: {update_err}"
 
 
+def list_contacted_unreplied_leads(api_key, *, limit_per_page=100, log=None, on_progress=None):
+    """Iterate ALL Instantly leads that have been contacted at least once
+    and have no replies. Returns the full list.
+
+    Uses POST /api/v2/leads/list with `filter=FILTER_VAL_CONTACTED` (server-
+    side narrowing to leads that received at least one email), then filters
+    each page in Python for `email_reply_count == 0`. Account-wide pagination
+    via `starting_after` cursor.
+
+    `on_progress(loaded_so_far)` is called after each page so the UI can
+    refresh a counter. `log(msg)` receives one-line status updates.
+    """
+    if not api_key:
+        return []
+
+    def _log(msg: str) -> None:
+        if log is not None:
+            try: log(msg)
+            except Exception: pass
+
+    url = f"{BASE_URL}/api/v2/leads/list"
+    headers = _headers(api_key)
+    starting_after: str | None = None
+    out: list[dict] = []
+    page = 0
+    max_pages = 500  # ~50k leads cap; adjust if account is larger
+
+    while page < max_pages:
+        body: dict = {
+            "limit": int(limit_per_page),
+            "filter": "FILTER_VAL_CONTACTED",
+        }
+        if starting_after:
+            body["starting_after"] = starting_after
+        try:
+            resp = _request_with_retry("POST", url, headers=headers, json_payload=body, timeout=30)
+        except Exception as e:
+            _log(f"⚠️ list_contacted_unreplied exception: {e}")
+            break
+        if resp.status_code != 200:
+            _log(f"⚠️ list_contacted_unreplied HTTP {resp.status_code}: {resp.text[:200]}")
+            break
+        payload = resp.json()
+        items = payload.get("items", payload if isinstance(payload, list) else [])
+        if not items:
+            break
+
+        kept = 0
+        for c in items:
+            try:
+                if int(c.get("email_reply_count") or 0) == 0:
+                    out.append(c)
+                    kept += 1
+            except (TypeError, ValueError):
+                continue
+
+        page += 1
+        if on_progress is not None:
+            try: on_progress(len(out))
+            except Exception: pass
+
+        next_cursor = payload.get("next_starting_after")
+        if next_cursor:
+            starting_after = next_cursor
+        elif len(items) < limit_per_page:
+            break
+        else:
+            starting_after = items[-1].get("id")
+            if not starting_after:
+                break
+
+    _log(f"📊 Listed {len(out)} contacted-unreplied leads across {page} page(s).")
+    return out
+
+
 def bulk_move_leads_to_campaign(api_key, lead_ids, campaign_id, debug=False):
     """Move many leads at once via Instantly's bulk move endpoint.
 
