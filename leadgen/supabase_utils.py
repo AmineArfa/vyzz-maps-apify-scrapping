@@ -369,6 +369,53 @@ _SAMPLE_COLUMNS = (
 )
 
 
+def fetch_unlinked_leads_with_email_sb(
+    conn: psycopg2.extensions.connection,
+    *,
+    limit: int | None = None,
+) -> list[dict]:
+    """Rows with NULL `instantly_lead_id` but a real email — candidates for
+    the reconciliation sweep. Some of these may already exist in Instantly
+    from earlier runs whose writeback was lost.
+    """
+    sql = """
+        SELECT id, contact_email, company_name, ticket_tier, industry
+          FROM raw.scraped_leads
+         WHERE instantly_lead_id IS NULL
+           AND contact_email IS NOT NULL
+           AND contact_email <> ''
+         ORDER BY created_at DESC NULLS LAST
+    """
+    params: list = []
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(int(limit))
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [_map_record_to_app(dict(r)) for r in cur.fetchall()]
+    except Exception as e:
+        st.error(f"Error fetching unlinked leads: {e}")
+        conn.rollback()
+        return []
+
+
+def count_unlinked_leads_with_email_sb(conn: psycopg2.extensions.connection) -> int:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM raw.scraped_leads "
+                "WHERE instantly_lead_id IS NULL "
+                "AND contact_email IS NOT NULL AND contact_email <> ''"
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    except Exception as e:
+        st.error(f"Error counting unlinked leads: {e}")
+        conn.rollback()
+        return 0
+
+
 def count_leads_without_tier_sb(conn: psycopg2.extensions.connection) -> int:
     """Count leads with `ticket_tier IS NULL` — they won't appear in any
     tier-segmented campaign filter, so the operator should know how many
@@ -559,6 +606,13 @@ class SupabaseBackend:
 
     def count_leads_without_tier(self) -> int:
         return count_leads_without_tier_sb(self.conn)
+
+    # ── Reconciliation: relink orphans whose writeback was lost ──
+    def fetch_unlinked_leads_with_email(self, *, limit: int | None = None) -> list[dict]:
+        return fetch_unlinked_leads_with_email_sb(self.conn, limit=limit)
+
+    def count_unlinked_leads_with_email(self) -> int:
+        return count_unlinked_leads_with_email_sb(self.conn)
 
     def count_leads_by_filter(
         self,

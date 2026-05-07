@@ -225,8 +225,28 @@ def push_leads_to_campaign(
             "error": None,
         })
 
+    def _writeback_one(r: dict) -> None:
+        """Flush a single lead writeback immediately to raw.scraped_leads.
+
+        Critical invariant: a successful Instantly create or move MUST be
+        persisted before we move on to the next operation. Buffering
+        writebacks in memory and flushing only at the end (the previous
+        design) loses everything if the run is interrupted — the lead
+        exists server-side (consuming plan capacity) but raw never knows,
+        and re-runs can't deduplicate it.
+        """
+        if r["op"] in ("moved", "created") and r.get("id") and r.get("instantly_lead_id"):
+            backend.batch_update([{
+                "id": r["id"],
+                "fields": {
+                    "instantly_lead_id": r["instantly_lead_id"],
+                    "instantly_campaign_id": campaign_id,
+                    "instantly_statuts": "Success",
+                    "last_synced_at": now_iso,
+                },
+            }])
+
     # ── Bulk move existing leads in chunks ───────────────────────────────
-    writeback: list[dict] = []
     moved_done = 0
     for i in range(0, len(to_move), _BULK_MOVE_CHUNK):
         chunk = to_move[i : i + _BULK_MOVE_CHUNK]
@@ -235,11 +255,14 @@ def push_leads_to_campaign(
             time.sleep(_BULK_MOVE_THROTTLE_SEC)
         ok, err = bulk_move_leads_to_campaign(api_key, ids, campaign_id, debug=debug)
         if ok:
+            # Per-chunk writeback BEFORE moving to the next chunk so a
+            # mid-loop crash leaves earlier chunks durably persisted.
+            chunk_writeback = []
             for lead in chunk:
                 results.append({
                     **_base_for(lead), "op": "moved", "error": None,
                 })
-                writeback.append({
+                chunk_writeback.append({
                     "id": lead["id"],
                     "fields": {
                         "instantly_lead_id": lead["instantly_lead_id"],
@@ -248,6 +271,8 @@ def push_leads_to_campaign(
                         "last_synced_at": now_iso,
                     },
                 })
+            if chunk_writeback:
+                backend.batch_update(chunk_writeback)
             moved_done += len(chunk)
         else:
             # Bulk failed — fall back to per-lead so we record granular
@@ -261,20 +286,11 @@ def push_leads_to_campaign(
                 for fut in as_completed(futures):
                     r = fut.result()
                     results.append(r)
-                    if r["op"] in ("moved", "created") and r.get("id") and r.get("instantly_lead_id"):
-                        writeback.append({
-                            "id": r["id"],
-                            "fields": {
-                                "instantly_lead_id": r["instantly_lead_id"],
-                                "instantly_campaign_id": campaign_id,
-                                "instantly_statuts": "Success",
-                                "last_synced_at": now_iso,
-                            },
-                        })
+                    _writeback_one(r)
             moved_done += len(chunk)
         _progress(len(already) + moved_done, "move")
 
-    # ── Per-lead create with writeback ───────────────────────────────────
+    # ── Per-lead create with immediate writeback ─────────────────────────
     create_done = 0
     if to_create:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -288,16 +304,10 @@ def push_leads_to_campaign(
             for fut in as_completed(futures):
                 r = fut.result()
                 results.append(r)
-                if r["op"] in ("moved", "created") and r.get("id") and r.get("instantly_lead_id"):
-                    writeback.append({
-                        "id": r["id"],
-                        "fields": {
-                            "instantly_lead_id": r["instantly_lead_id"],
-                            "instantly_campaign_id": campaign_id,
-                            "instantly_statuts": "Success",
-                            "last_synced_at": now_iso,
-                        },
-                    })
+                # IMMEDIATELY persist the new instantly_lead_id back to raw
+                # so a subsequent crash never leaves an orphaned Instantly
+                # lead that raw doesn't know about.
+                _writeback_one(r)
                 create_done += 1
                 _progress(len(already) + len(to_move) + create_done, "create")
 
@@ -307,14 +317,107 @@ def push_leads_to_campaign(
             **_base_for(lead), "op": "skipped", "error": "no email",
         })
 
-    if writeback:
-        backend.batch_update(writeback)
-
     counts = {"moved": 0, "created": 0, "skipped": 0, "failed": 0, "already_in_place": 0}
     for r in results:
         counts[r["op"]] = counts.get(r["op"], 0) + 1
     counts["details"] = results
     return counts
+
+
+def reconcile_unlinked_leads(
+    backend,
+    *,
+    api_key: str,
+    debug: bool = False,
+    max_workers: int = 5,
+    limit: int | None = None,
+    on_progress=None,
+) -> dict:
+    """Recover leads whose Instantly create succeeded but writeback was lost.
+
+    For each raw row with `instantly_lead_id IS NULL` and a real email,
+    search Instantly by email. If found, write the existing lead id back
+    so subsequent runs treat the row as MOVE-eligible (not CREATE-eligible),
+    avoiding duplicates and reclaiming visibility into Instantly state.
+
+    Returns:
+        {
+            "scanned": int,
+            "linked": int,
+            "not_found": int,
+            "errored": int,
+            "details": [ { id, email, found_id, found_campaign, error } ],
+        }
+    """
+    candidates = backend.fetch_unlinked_leads_with_email(limit=limit)
+    total = len(candidates)
+    if not total:
+        return {"scanned": 0, "linked": 0, "not_found": 0, "errored": 0, "details": []}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    linked = 0
+    not_found = 0
+    errored = 0
+    details: list[dict] = []
+
+    def _one(lead: dict) -> dict:
+        raw_id = lead.get("id")
+        email = _normalize_email(lead.get("key_contact_email"))
+        if not email:
+            return {"id": raw_id, "email": None, "found_id": None, "error": "no email"}
+        found, err = search_lead_by_email(api_key, email, debug=debug)
+        if found and found.get("id") and is_valid_uuid(found["id"]):
+            return {
+                "id": raw_id, "email": email,
+                "found_id": found["id"],
+                "found_campaign": found.get("campaign"),
+                "error": None,
+            }
+        return {
+            "id": raw_id, "email": email,
+            "found_id": None, "found_campaign": None,
+            "error": err,
+        }
+
+    processed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_one, l): l for l in candidates}
+        for fut in as_completed(futures):
+            r = fut.result()
+            processed += 1
+            details.append(r)
+            if r.get("found_id"):
+                # Immediate writeback — same crash-safety principle as the
+                # main push: never let an Instantly identity sit unlinked
+                # in raw if we already know about it.
+                fields = {
+                    "instantly_lead_id": r["found_id"],
+                    "last_synced_at": now_iso,
+                }
+                if r.get("found_campaign"):
+                    fields["instantly_campaign_id"] = r["found_campaign"]
+                ok = backend.batch_update([{"id": r["id"], "fields": fields}])
+                if ok:
+                    linked += 1
+                else:
+                    errored += 1
+            elif r.get("error"):
+                errored += 1
+            else:
+                not_found += 1
+            if on_progress is not None:
+                try:
+                    on_progress(processed, total)
+                except Exception:
+                    pass
+
+    return {
+        "scanned": total,
+        "linked": linked,
+        "not_found": not_found,
+        "errored": errored,
+        "details": details,
+    }
 
 
 def recategorize_all_by_tier(

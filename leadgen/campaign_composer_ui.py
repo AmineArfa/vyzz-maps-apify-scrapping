@@ -15,7 +15,11 @@ import pandas as pd
 import streamlit as st
 
 from .campaign_filter import FilterSpecError, describe, spec_from_picker
-from .campaign_push import push_leads_to_campaign, recategorize_all_by_tier
+from .campaign_push import (
+    push_leads_to_campaign,
+    recategorize_all_by_tier,
+    reconcile_unlinked_leads,
+)
 from .instantly import (
     _list_all_campaigns,
     find_or_create_instantly_campaign,
@@ -123,6 +127,87 @@ def _push_to_campaign(
         **{k: v for k, v in push_result.items() if k != "details"},
         "details": push_result["details"],
     }
+
+
+def _render_reconcile_section(backend, secrets: dict, debug: bool) -> None:
+    """Recover leads whose Instantly create succeeded but writeback was lost.
+
+    Symptom: raw.scraped_leads.instantly_lead_id IS NULL but the lead does
+    exist in Instantly under the same email. The previous push design
+    accumulated writebacks in memory and flushed only at the end, so any
+    interruption left those creates orphaned. Run this once after every
+    big push to relink them — and on a recurring basis as a safety net.
+    """
+    st.subheader("🔗 Reconcile orphaned leads")
+    st.caption(
+        "For each raw lead with no `instantly_lead_id` but a real email, "
+        "search Instantly by email. If a match exists, write the id back "
+        "to `raw.scraped_leads`. Recovers leads that were created on "
+        "Instantly but whose writeback to raw was lost mid-run."
+    )
+
+    try:
+        unlinked = backend.count_unlinked_leads_with_email()
+    except Exception as e:
+        st.error(f"Could not count unlinked leads: {e}")
+        return
+
+    if unlinked == 0:
+        st.success("Nothing to reconcile — every raw row with an email is already linked.")
+        return
+
+    st.metric("Unlinked rows with email", unlinked)
+    st.caption(
+        f"⏱ At ~5 parallel workers, expect roughly **{max(unlinked // 600, 1)}–"
+        f"{max(unlinked // 300, 1)} minutes** for {unlinked} leads (rate-limited "
+        "by Instantly's search endpoint). Re-run is safe and idempotent."
+    )
+
+    confirmed = st.checkbox(
+        "I understand this will run a search per unlinked lead.",
+        key="recon_confirm",
+    )
+
+    if st.button(
+        "🔗 Run reconciliation",
+        type="primary",
+        disabled=not confirmed,
+        key="recon_run_btn",
+    ):
+        api_key = secrets.get("instantly_key")
+        if not api_key:
+            st.error("Instantly API key missing.")
+            return
+
+        with st.status("Reconciling unlinked leads...", expanded=True) as status:
+            progress_bar = st.progress(0.0, text="Starting...")
+
+            def _on_progress(done, total):
+                pct = min(done / total, 1.0) if total else 1.0
+                progress_bar.progress(pct, text=f"{done}/{total} scanned")
+
+            result = reconcile_unlinked_leads(
+                backend, api_key=api_key, debug=debug, on_progress=_on_progress,
+            )
+            progress_bar.progress(1.0, text="Done.")
+            status.write(
+                f"✅ Done. Scanned={result['scanned']} Linked={result['linked']} "
+                f"NotFound={result['not_found']} Errored={result['errored']}"
+            )
+
+        cols = st.columns(4)
+        cols[0].metric("Scanned", result["scanned"])
+        cols[1].metric("Linked", result["linked"])
+        cols[2].metric("Not in Instantly", result["not_found"])
+        cols[3].metric("Errored", result["errored"])
+
+        if result["errored"]:
+            err_rows = [
+                {"id": d["id"], "email": d["email"], "error": d["error"]}
+                for d in result["details"] if d.get("error")
+            ][:50]
+            with st.expander(f"⚠️ {result['errored']} errored", expanded=False):
+                st.dataframe(pd.DataFrame(err_rows), use_container_width=True, hide_index=True)
 
 
 def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
@@ -367,6 +452,10 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
     if active_mode != "supabase":
         st.info("Campaign composer requires the Supabase backend.")
         return
+
+    # ── 0. Reconcile orphaned leads (run BEFORE any push) ────────────────
+    _render_reconcile_section(backend, secrets, debug_mode)
+    st.divider()
 
     # ── 1. Bulk recategorization (always visible) ────────────────────────
     _render_recategorize_section(backend, secrets, debug_mode)

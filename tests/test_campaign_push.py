@@ -288,6 +288,147 @@ class PushFlowTests(unittest.TestCase):
         self.assertEqual(ids_written, ["raw-A", "raw-B"])
 
 
+class ImmediateWritebackTests(unittest.TestCase):
+    """Crash-safety: every successful create / move chunk persists BEFORE
+    the next operation. Buffering writebacks in memory and flushing only
+    at the end (the previous design) lost data on every interruption.
+    """
+
+    class _OrderTrackingBackend:
+        """Records the call order of bulk_move and batch_update so we can
+        prove writeback for chunk N happens before bulk_move for chunk N+1.
+        """
+        def __init__(self):
+            self.calls: list[tuple[str, int]] = []
+            self.updates: list[dict] = []
+
+        def batch_update(self, updates):
+            self.calls.append(("batch_update", len(updates)))
+            self.updates.extend(updates)
+            return True
+
+    def test_writeback_flushes_per_chunk(self):
+        backend = self._OrderTrackingBackend()
+        leads = [{
+            "id": f"raw-{i}", "key_contact_email": f"u{i}@x.com",
+            "instantly_lead_id": _uuid(200 + i),
+        } for i in range(120)]  # spans 3 chunks at chunk_size=50
+
+        bulk_call_count = {"n": 0}
+        def fake_bulk(api_key, ids, campaign_id, debug=False):
+            bulk_call_count["n"] += 1
+            backend.calls.append(("bulk_move", len(ids)))
+            return True, None
+
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", side_effect=fake_bulk), \
+                patch.object(campaign_push.time, "sleep"):
+            campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+
+        # Expect call sequence: bulk, batch_update, bulk, batch_update, bulk, batch_update.
+        # The previous (buggy) design was: bulk, bulk, bulk, batch_update.
+        self.assertEqual(
+            [name for name, _ in backend.calls],
+            ["bulk_move", "batch_update",
+             "bulk_move", "batch_update",
+             "bulk_move", "batch_update"],
+        )
+        # Every writeback fires before the next bulk_move starts.
+        self.assertEqual(len(backend.updates), 120)
+
+    def test_create_writeback_is_per_lead_not_batched(self):
+        backend = self._OrderTrackingBackend()
+        new_id = _uuid(300)
+        leads = [{
+            "id": "raw-new",
+            "key_contact_email": "new@x.com",
+            "instantly_lead_id": None,
+        }]
+
+        with patch.object(
+                    campaign_push, "export_leads_to_instantly",
+                    return_value=(1, [{"id": new_id, "email": "new@x.com"}], {}, None),
+                ), \
+                patch.object(campaign_push, "inject_lid_to_lead", return_value=(True, None)):
+            campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+
+        # The single create wrote back its id immediately, not at the end
+        # of the function — so a crash after the API call but before the
+        # next operation still persists this lead.
+        self.assertEqual(len(backend.updates), 1)
+        self.assertEqual(backend.updates[0]["fields"]["instantly_lead_id"], new_id)
+
+
+class ReconcileUnlinkedLeadsTests(unittest.TestCase):
+    """Reconciliation sweep recovers leads whose writeback was lost in a
+    previous interrupted run.
+    """
+
+    class _RecBackend:
+        def __init__(self, candidates):
+            self.candidates = list(candidates)
+            self.updates: list[dict] = []
+
+        def fetch_unlinked_leads_with_email(self, *, limit=None):
+            return list(self.candidates)
+
+        def batch_update(self, updates):
+            self.updates.extend(updates)
+            return True
+
+    def test_links_back_when_instantly_has_match(self):
+        found_id = _uuid(401)
+        backend = self._RecBackend([
+            {"id": "raw-A", "key_contact_email": "a@x.com"},
+            {"id": "raw-B", "key_contact_email": "b@x.com"},
+        ])
+
+        def fake_search(api_key, email, debug=False):
+            if email == "a@x.com":
+                return ({"id": found_id, "campaign": _uuid(500)}, None)
+            return (None, None)
+
+        with patch.object(campaign_push, "search_lead_by_email", side_effect=fake_search):
+            result = campaign_push.reconcile_unlinked_leads(
+                backend, api_key="k", max_workers=1,
+            )
+
+        self.assertEqual(result["scanned"], 2)
+        self.assertEqual(result["linked"], 1)
+        self.assertEqual(result["not_found"], 1)
+        self.assertEqual(len(backend.updates), 1)
+        upd = backend.updates[0]
+        self.assertEqual(upd["id"], "raw-A")
+        self.assertEqual(upd["fields"]["instantly_lead_id"], found_id)
+        # If Instantly tells us the campaign too, we capture that as well.
+        self.assertIn("instantly_campaign_id", upd["fields"])
+
+    def test_no_match_records_not_found(self):
+        backend = self._RecBackend([
+            {"id": "raw-X", "key_contact_email": "x@x.com"},
+        ])
+        with patch.object(campaign_push, "search_lead_by_email", return_value=(None, None)):
+            result = campaign_push.reconcile_unlinked_leads(
+                backend, api_key="k", max_workers=1,
+            )
+        self.assertEqual(result["linked"], 0)
+        self.assertEqual(result["not_found"], 1)
+        self.assertEqual(backend.updates, [])
+
+    def test_empty_candidate_set(self):
+        backend = self._RecBackend([])
+        # No search calls expected.
+        with patch.object(campaign_push, "search_lead_by_email") as m_search:
+            result = campaign_push.reconcile_unlinked_leads(
+                backend, api_key="k", max_workers=1,
+            )
+        m_search.assert_not_called()
+        self.assertEqual(result["scanned"], 0)
+
+
 class RecategorizeAllTests(unittest.TestCase):
     """recategorize_all_by_tier loops the three tiers and aggregates."""
 
