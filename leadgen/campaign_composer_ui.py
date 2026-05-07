@@ -238,11 +238,22 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
 
             def _resolve(tier: str) -> str | None:
                 name = tier_names[tier]
-                status.write(f"Resolving Instantly campaign '{name}'...")
-                return find_or_create_instantly_campaign(api_key, name, debug=debug)
+                status.write(f"━━━ Tier '{tier}' → '{name}' ━━━")
+                # Pass status.write as the log callback so every internal
+                # step (cache check, search, create, race recovery) is
+                # visible. Previously a hung resolver showed only "Resolving…"
+                # with no insight into which call was actually blocking.
+                return find_or_create_instantly_campaign(
+                    api_key, name, log=status.write, debug=debug,
+                )
 
             result = recategorize_all_by_tier(
                 backend, api_key=api_key, resolve_campaign_id=_resolve, debug=debug,
+            )
+            status.write(
+                f"Done. Moved={result['moved']} Created={result['created']} "
+                f"AlreadyInPlace={result.get('already_in_place', 0)} "
+                f"Skipped={result['skipped']} Failed={result['failed']}"
             )
 
             for tier, r in result["by_tier"].items():
