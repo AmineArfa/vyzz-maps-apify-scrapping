@@ -5,6 +5,7 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.worksheet.datavalidation import DataValidation
 
+from leadgen import campaign_composer_ui
 from leadgen.backend import AirtableBackend
 from leadgen.config import get_secrets
 from leadgen.credits import display_credit_dashboard
@@ -145,9 +146,13 @@ def main():
     # --- TABS ---
     show_legacy_generator = st.sidebar.checkbox("Show Legacy Generator", value=False, help="Show the Apify/Apollo scraping tab (legacy)")
     if show_legacy_generator:
-        tab_gen, tab_man = st.tabs(["🚀 Lead Generator (Legacy)", "📝 Lead Manager"])
+        tab_gen, tab_man, tab_camp = st.tabs([
+            "🚀 Lead Generator (Legacy)",
+            "📝 Lead Manager",
+            "📣 Campaign Composer",
+        ])
     else:
-        tab_man = st.tabs(["📝 Lead Manager"])[0]
+        tab_man, tab_camp = st.tabs(["📝 Lead Manager", "📣 Campaign Composer"])
         tab_gen = None
 
     # --- TAB 1: GENERATOR (Legacy, hidden by default) ---
@@ -660,6 +665,14 @@ def main():
                     del st.session_state["last_sync_results"]
                     st.rerun()
 
+    # --- TAB 3: CAMPAIGN COMPOSER ---
+    with tab_camp:
+        campaign_composer_ui.render(
+            backend,
+            secrets,
+            active_mode=active_mode,
+            debug_mode=debug_mode,
+        )
 
 
 if __name__ == "__main__":

@@ -109,6 +109,44 @@ class CreatePayloadTests(unittest.TestCase):
                 cv = payload["leads"][0].get("custom_variables") or {}
                 self.assertNotIn("industry", cv)
 
+    def test_industry_and_ticket_tier_both_present(self):
+        # When the source row has both industry and ticket_tier, the outgoing
+        # Instantly payload must contain both keys with the exact source
+        # values — no re-normalization. Other custom_variables we manage
+        # must still be there and unchanged.
+        payload = self._capture_create_payload({
+            "key_contact_email": "alice@example.com",
+            "key_contact_name": "Alice Doe",
+            "key_contact_position": "CEO",
+            "company_name": "Acme",
+            "industry": "Med Spa",
+            "ticket_tier": "low",
+            "city": "Austin",
+            "state": "TX",
+            "postal_code": "78701",
+            "competitor1": "Acme Rival",
+        })
+        cv = payload["leads"][0]["custom_variables"]
+        self.assertEqual(cv["industry"], "Med Spa")
+        self.assertEqual(cv["ticket_tier"], "low")
+        self.assertEqual(cv["jobTitle"], "CEO")
+        self.assertEqual(cv["City"], "Austin")
+        self.assertEqual(cv["state"], "TX")
+        self.assertEqual(cv["postalCode"], "78701")
+        self.assertEqual(cv["competitor1"], "Acme Rival")
+
+    def test_ticket_tier_omitted_when_null(self):
+        for missing in [None, "", []]:
+            with self.subTest(value=missing):
+                payload = self._capture_create_payload({
+                    "key_contact_email": "x@y.com",
+                    "industry": "Dentist",
+                    "ticket_tier": missing,
+                })
+                cv = payload["leads"][0].get("custom_variables") or {}
+                self.assertNotIn("ticket_tier", cv)
+                self.assertEqual(cv.get("industry"), "Dentist")
+
 
 class PatchPayloadTests(unittest.TestCase):
     """`_build_patch_payload` is the canonical builder for PATCH updates."""
@@ -152,6 +190,37 @@ class PatchPayloadTests(unittest.TestCase):
             existing_custom_variables=existing,
         )
         self.assertEqual(payload["custom_variables"]["industry"], "Med Spa")
+
+    def test_industry_and_ticket_tier_merged_with_existing(self):
+        # Both new keys end up in the PATCH payload alongside existing,
+        # unrelated keys.
+        existing = {"some_other_var": "keep-me", "ticket_tier": "high"}
+        payload = _build_patch_payload(
+            {
+                "key_contact_email": "a@b.com",
+                "industry": "Med Spa",
+                "ticket_tier": "low",  # operator override wins
+            },
+            instantly_lead_id="00000000-0000-0000-0000-000000000001",
+            existing_custom_variables=existing,
+        )
+        cv = payload["custom_variables"]
+        self.assertEqual(cv["industry"], "Med Spa")
+        self.assertEqual(cv["ticket_tier"], "low")
+        self.assertEqual(cv["some_other_var"], "keep-me")
+
+    def test_ticket_tier_omitted_when_empty_in_source(self):
+        # If source row has industry but null ticket_tier, we omit
+        # ticket_tier from the merged dict (whatever Instantly has stays).
+        existing = {"ticket_tier": "high"}
+        payload = _build_patch_payload(
+            {"key_contact_email": "a@b.com", "industry": "Dentist", "ticket_tier": ""},
+            instantly_lead_id="00000000-0000-0000-0000-000000000001",
+            existing_custom_variables=existing,
+        )
+        cv = payload["custom_variables"]
+        self.assertEqual(cv["ticket_tier"], "high")  # preserved from existing
+        self.assertEqual(cv["industry"], "Dentist")
 
 
 if __name__ == "__main__":
