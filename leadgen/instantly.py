@@ -548,6 +548,46 @@ def inject_lid_to_lead(api_key, lead_id, debug=False):
     return False, f"Failed to inject lid: {update_err}"
 
 
+def move_lead_to_campaign(api_key, lead_id, campaign_id, debug=False):
+    """Move an existing Instantly lead into `campaign_id`. Idempotent.
+
+    Use this for leads that already have an `instantly_lead_id`: PATCHing
+    `campaign_id` reassigns the existing lead row, which preserves the id
+    on both sides and avoids creating a duplicate. Per-lead campaign
+    membership is the model — Instantly leads belong to one campaign.
+
+    Implemented via the bulk move endpoint (POST /api/v2/leads/move) so
+    the same call works whether the lead was already in `campaign_id`
+    (no-op) or in another one (reassignment).
+    """
+    if not api_key or not lead_id or not campaign_id:
+        return False, "Missing api_key, lead_id, or campaign_id"
+    if not is_valid_uuid(lead_id):
+        return False, f"Invalid Lead ID format: {lead_id}"
+    if not is_valid_uuid(campaign_id):
+        return False, f"Invalid campaign_id format: {campaign_id}"
+
+    url = f"{BASE_URL}/api/v2/leads/move"
+    headers = _headers(api_key)
+    payload = {"ids": [lead_id], "to_campaign_id": campaign_id}
+
+    try:
+        resp = _request_with_retry("POST", url, headers=headers, json_payload=payload, timeout=20)
+        if 200 <= resp.status_code < 300:
+            if debug:
+                st.write(f"➡️ Moved lead {lead_id[:8]}… into campaign {campaign_id[:8]}…")
+            return True, None
+        err = f"Instantly move failed: {resp.status_code} - {resp.text}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
+    except Exception as e:
+        err = f"Instantly move exception: {e}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
+
+
 def delete_lead_from_instantly(api_key, lead_id, debug=False):
     """
     Delete a lead from Instantly.
