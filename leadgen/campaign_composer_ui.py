@@ -20,6 +20,7 @@ from .campaign_push import (
     recategorize_all_by_tier,
     reconcile_unlinked_leads,
 )
+from .prune import execute_prune, preview_contacted_unreplied
 from .instantly import (
     _list_all_campaigns,
     find_or_create_instantly_campaign,
@@ -127,6 +128,118 @@ def _push_to_campaign(
         **{k: v for k, v in push_result.items() if k != "details"},
         "details": push_result["details"],
     }
+
+
+def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
+    """Prune leads contacted-but-never-replied.
+
+    Two-step UX: COMPUTE COUNTS first (paginates Instantly, shows per-industry
+    breakdown), then RUN (deletes from Instantly + soft-deletes in raw).
+    Preview is cached in session_state between the two clicks so the operator
+    sees the same numbers they confirmed.
+    """
+    st.subheader("🧹 Prune contacted-but-never-replied")
+    st.caption(
+        "Deletes leads from Instantly **and** soft-deletes the matching "
+        "raw.scraped_leads row (sets `excluded_at`, reversible). Criterion: "
+        "lead was emailed at least once AND has zero replies."
+    )
+
+    api_key = secrets.get("instantly_key")
+    if not api_key:
+        st.error("Instantly API key missing.")
+        return
+
+    if st.button("📊 Compute counts", key="prune_compute_btn"):
+        with st.status("Listing contacted leads with no replies…", expanded=True) as status:
+            counter_box = st.empty()
+
+            def _on_progress(loaded):
+                counter_box.write(f"Loaded {loaded} candidates so far…")
+
+            preview = preview_contacted_unreplied(
+                api_key, log=status.write, on_progress=_on_progress,
+            )
+            status.write(f"✅ Total candidates: {preview['total']}")
+
+        st.session_state["prune_preview"] = preview
+
+    preview = st.session_state.get("prune_preview")
+    if not preview:
+        st.info("Click **📊 Compute counts** above to see how many leads would be pruned, broken down by industry.")
+        return
+
+    st.metric("Total candidates", preview["total"])
+
+    if preview["total"] == 0:
+        st.success("Nothing to prune — every contacted lead has at least one reply.")
+        return
+
+    # Per-industry breakdown
+    rows = [{"industry": ind or "(unknown)", "count": cnt}
+            for ind, cnt in preview["by_industry"]]
+    st.caption("Per-industry breakdown:")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # Sample of first 20 candidates
+    sample_rows = []
+    for c in preview["candidates"][:20]:
+        sample_rows.append({
+            "email": c.get("email") or "—",
+            "company": c.get("company_name") or "—",
+            "industry": (c.get("payload") or {}).get("industry", "—"),
+            "last_contact": c.get("timestamp_last_contact") or "—",
+        })
+    if sample_rows:
+        st.caption("Sample (first 20):")
+        st.dataframe(pd.DataFrame(sample_rows), use_container_width=True, hide_index=True)
+
+    confirmed = st.checkbox(
+        f"I understand this will permanently delete {preview['total']} leads from Instantly "
+        f"(soft-deleted in raw, reversible).",
+        key="prune_confirm",
+    )
+
+    if st.button(
+        "🧹 Run prune",
+        type="primary",
+        disabled=not confirmed,
+        key="prune_run_btn",
+    ):
+        with st.status("Pruning leads…", expanded=True) as status:
+            progress_bar = st.progress(0.0, text="Starting…")
+
+            def _on_progress(done, total):
+                pct = min(done / total, 1.0) if total else 1.0
+                progress_bar.progress(pct, text=f"{done}/{total} processed")
+
+            result = execute_prune(
+                backend, api_key=api_key,
+                candidates=preview["candidates"],
+                debug=debug, on_progress=_on_progress,
+            )
+            progress_bar.progress(1.0, text="Done.")
+            status.write(
+                f"✅ Done. Instantly deleted={result['deleted_instantly']} "
+                f"raw soft-deleted={result['soft_deleted_raw']} "
+                f"failed={result['failed']}"
+            )
+
+        cols = st.columns(3)
+        cols[0].metric("Deleted from Instantly", result["deleted_instantly"])
+        cols[1].metric("Soft-deleted in raw", result["soft_deleted_raw"])
+        cols[2].metric("Failed", result["failed"])
+
+        if result["failed"]:
+            err_rows = [
+                {"email": d.get("email"), "industry": d.get("industry"), "error": d.get("error")}
+                for d in result["details"] if d.get("error")
+            ][:50]
+            with st.expander(f"⚠️ {result['failed']} failures", expanded=False):
+                st.dataframe(pd.DataFrame(err_rows), use_container_width=True, hide_index=True)
+
+        # Invalidate the preview so a re-click re-fetches.
+        st.session_state.pop("prune_preview", None)
 
 
 def _render_reconcile_section(backend, secrets: dict, debug: bool) -> None:
@@ -459,6 +572,10 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
 
     # ── 1. Bulk recategorization (always visible) ────────────────────────
     _render_recategorize_section(backend, secrets, debug_mode)
+    st.divider()
+
+    # ── 1.5 Prune contacted-no-reply leads (destructive — review first) ──
+    _render_prune_section(backend, secrets, debug_mode)
     st.divider()
 
     # ── 2. Single-segment picker (ad-hoc) ────────────────────────────────

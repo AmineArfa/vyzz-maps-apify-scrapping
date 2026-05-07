@@ -49,6 +49,7 @@ VALID_SB_COLUMNS = {
     "competitor1", "competitor2", "competitor3",
     "instantly_lead_id", "instantly_campaign_id", "instantly_status",
     "instantly_synced_at",
+    "excluded_at", "excluded_reason",
 }
 
 # Columns for INSERT (subset of VALID_SB_COLUMNS, fixed order for execute_values)
@@ -66,7 +67,9 @@ INSERT_COLUMNS = [
 # to "low"). Update paths must NOT silently re-derive tier from industry.
 COMPUTED_ON_INSERT_ONLY = {"ticket_tier"}
 
-# Columns for dedup reads (minimal)
+# Columns for dedup reads (minimal). Excluded (soft-deleted) rows still
+# count for dedup so we don't re-import a lead the operator has already
+# pruned — but every other read path filters them out.
 DEDUP_QUERY = "SELECT website, phone FROM raw.scraped_leads WHERE website IS NOT NULL OR phone IS NOT NULL"
 
 # Columns for sync manager reads (21 of 26 — excludes source_tool, import_batch_id,
@@ -79,6 +82,7 @@ SELECT id, company_name, industry, ticket_tier, website, city, state,
        instantly_synced_at, updated_at, verification_status,
        competitor1, competitor2, competitor3
 FROM raw.scraped_leads
+WHERE excluded_at IS NULL
 """
 
 # Hardcoded industry list (from current Airtable dropdown — no metadata API in Postgres)
@@ -384,6 +388,7 @@ def fetch_unlinked_leads_with_email_sb(
          WHERE instantly_lead_id IS NULL
            AND contact_email IS NOT NULL
            AND contact_email <> ''
+           AND excluded_at IS NULL
          ORDER BY created_at DESC NULLS LAST
     """
     params: list = []
@@ -400,13 +405,62 @@ def fetch_unlinked_leads_with_email_sb(
         return []
 
 
+def soft_delete_by_instantly_id_or_email_sb(
+    conn: psycopg2.extensions.connection,
+    *,
+    instantly_lead_id: str | None,
+    email: str | None,
+    fields: dict,
+) -> bool:
+    """Match a single raw row by instantly_lead_id (preferred) or email,
+    apply `fields`. Returns True iff at least one row was updated.
+
+    The prune flow gets Instantly's lead representation, not the raw uuid,
+    so we match on the foreign keys we do have. If neither key is set we
+    can't match — return False.
+    """
+    if not instantly_lead_id and not email:
+        return False
+    set_parts = []
+    params: list = []
+    for k, v in fields.items():
+        sb_key = APP_TO_SB.get(k, k)
+        if sb_key in VALID_SB_COLUMNS:
+            set_parts.append(f"{sb_key} = %s")
+            params.append(v)
+    if not set_parts:
+        return False
+    set_parts.append("updated_at = NOW()")
+
+    where = []
+    if instantly_lead_id:
+        where.append("instantly_lead_id = %s")
+        params.append(instantly_lead_id)
+    elif email:
+        where.append("LOWER(contact_email) = LOWER(%s)")
+        params.append(email)
+
+    sql = f"UPDATE raw.scraped_leads SET {', '.join(set_parts)} WHERE {' AND '.join(where)}"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            updated = cur.rowcount
+        conn.commit()
+        return updated > 0
+    except Exception as e:
+        conn.rollback()
+        st.error(f"soft_delete_by_instantly_id_or_email failed: {e}")
+        return False
+
+
 def count_unlinked_leads_with_email_sb(conn: psycopg2.extensions.connection) -> int:
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM raw.scraped_leads "
                 "WHERE instantly_lead_id IS NULL "
-                "AND contact_email IS NOT NULL AND contact_email <> ''"
+                "AND contact_email IS NOT NULL AND contact_email <> '' "
+                "AND excluded_at IS NULL"
             )
             row = cur.fetchone()
             return int(row[0]) if row else 0
@@ -424,7 +478,8 @@ def count_leads_without_tier_sb(conn: psycopg2.extensions.connection) -> int:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM raw.scraped_leads "
-                "WHERE ticket_tier IS NULL OR ticket_tier = ''"
+                "WHERE (ticket_tier IS NULL OR ticket_tier = '') "
+                "AND excluded_at IS NULL"
             )
             row = cur.fetchone()
             return int(row[0]) if row else 0
@@ -441,6 +496,7 @@ def fetch_distinct_industries_sb(conn: psycopg2.extensions.connection) -> list[s
             cur.execute(
                 "SELECT DISTINCT industry FROM raw.scraped_leads "
                 "WHERE industry IS NOT NULL AND industry <> '' "
+                "AND excluded_at IS NULL "
                 "ORDER BY industry"
             )
             return [r[0] for r in cur.fetchall()]
@@ -613,6 +669,14 @@ class SupabaseBackend:
 
     def count_unlinked_leads_with_email(self) -> int:
         return count_unlinked_leads_with_email_sb(self.conn)
+
+    def soft_delete_by_instantly_id_or_email(
+        self, *, instantly_lead_id: str | None, email: str | None, fields: dict,
+    ) -> bool:
+        return soft_delete_by_instantly_id_or_email_sb(
+            self.conn,
+            instantly_lead_id=instantly_lead_id, email=email, fields=fields,
+        )
 
     def count_leads_by_filter(
         self,
