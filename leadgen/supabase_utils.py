@@ -18,7 +18,9 @@ import psycopg2
 import psycopg2.extras
 import streamlit as st
 
+from .campaign_filter import build_where as build_filter_where
 from .json_sanitize import sanitize_for_json
+from .ticket_tier import compute_ticket_tier
 
 # ── Field name mapping (app-internal → Supabase column) ──────────────────
 
@@ -39,7 +41,8 @@ SKIP_ON_INSERT = {"id", "createdTime", "last_modified_at", "created_at", "update
 
 # All valid columns in raw.scraped_leads (for filtering writes)
 VALID_SB_COLUMNS = {
-    "source_tool", "import_batch_id", "company_name", "industry", "website",
+    "source_tool", "import_batch_id", "company_name", "industry", "ticket_tier",
+    "website",
     "city", "state", "postal_code", "postal_address", "phone", "rating",
     "contact_name", "contact_email", "contact_position",
     "email_verified", "verification_status", "verified_at",
@@ -50,11 +53,18 @@ VALID_SB_COLUMNS = {
 
 # Columns for INSERT (subset of VALID_SB_COLUMNS, fixed order for execute_values)
 INSERT_COLUMNS = [
-    "source_tool", "import_batch_id", "company_name", "industry", "website",
+    "source_tool", "import_batch_id", "company_name", "industry", "ticket_tier",
+    "website",
     "city", "state", "postal_code", "postal_address", "phone", "rating",
     "contact_name", "contact_email", "contact_position",
     "competitor1", "competitor2", "competitor3",
 ]
+
+# ticket_tier is computed from industry on INSERT only. We never auto-recompute
+# it on UPDATE — once a row has a tier, it is treated as operator-set (a
+# luxury restaurant could be "high" even though Restaurants and Bars defaults
+# to "low"). Update paths must NOT silently re-derive tier from industry.
+COMPUTED_ON_INSERT_ONLY = {"ticket_tier"}
 
 # Columns for dedup reads (minimal)
 DEDUP_QUERY = "SELECT website, phone FROM raw.scraped_leads WHERE website IS NOT NULL OR phone IS NOT NULL"
@@ -62,8 +72,9 @@ DEDUP_QUERY = "SELECT website, phone FROM raw.scraped_leads WHERE website IS NOT
 # Columns for sync manager reads (21 of 26 — excludes source_tool, import_batch_id,
 # email_verified, verified_at, rating, created_at)
 SYNC_QUERY = """
-SELECT id, company_name, industry, website, city, state, postal_code,
-       postal_address, phone, contact_name, contact_email, contact_position,
+SELECT id, company_name, industry, ticket_tier, website, city, state,
+       postal_code, postal_address, phone,
+       contact_name, contact_email, contact_position,
        instantly_lead_id, instantly_campaign_id, instantly_status,
        instantly_synced_at, updated_at, verification_status,
        competitor1, competitor2, competitor3
@@ -122,10 +133,18 @@ def _map_record_to_app(record: dict) -> dict:
 
 
 def _row_to_insert_tuple(record: dict, source_tool: str, batch_id: str) -> tuple:
-    """Convert a mapped record to a tuple matching INSERT_COLUMNS order."""
+    """Convert a mapped record to a tuple matching INSERT_COLUMNS order.
+
+    Computes `ticket_tier` from `industry` on INSERT when the caller did not
+    supply one. Treat any tier the caller passed in as authoritative — that
+    way a future bulk-import flow that already classifies leads can override
+    the default mapping.
+    """
     mapped = _map_record_to_sb(record)
     mapped["source_tool"] = source_tool
     mapped["import_batch_id"] = batch_id
+    if not mapped.get("ticket_tier"):
+        mapped["ticket_tier"] = compute_ticket_tier(mapped.get("industry"))
     return tuple(mapped.get(col) for col in INSERT_COLUMNS)
 
 
@@ -302,6 +321,13 @@ def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[di
                 sync_ts_value = None
                 for key, value in fields.items():
                     sb_key = APP_TO_SB.get(key, key)
+                    if sb_key in COMPUTED_ON_INSERT_ONLY:
+                        # ticket_tier is operator-overridable. The sync /
+                        # post-import write paths must not auto-recompute it
+                        # from industry. Operators set it explicitly through
+                        # a dedicated admin action (not through this generic
+                        # batch_update).
+                        continue
                     if sb_key in VALID_SB_COLUMNS:
                         set_parts.append(f"{sb_key} = %s")
                         params.append(value)
@@ -331,6 +357,128 @@ def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[di
         conn.rollback()
         st.error(f"Supabase batch update failed: {e}")
         return False
+
+
+# ── Campaign composer: filter, count, persist ────────────────────────────
+
+# Columns returned for the sample preview / push-eligibility list.
+_SAMPLE_COLUMNS = (
+    "id", "company_name", "industry", "ticket_tier", "city", "state",
+    "contact_email", "contact_name", "website", "phone",
+    "instantly_lead_id", "instantly_campaign_id", "verification_status",
+)
+
+
+def fetch_distinct_industries_sb(conn: psycopg2.extensions.connection) -> list[str]:
+    """Return the distinct, non-null industries currently in raw.scraped_leads."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT industry FROM raw.scraped_leads "
+                "WHERE industry IS NOT NULL AND industry <> '' "
+                "ORDER BY industry"
+            )
+            return [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        st.error(f"Error loading industries: {e}")
+        conn.rollback()
+        return []
+
+
+def count_leads_by_filter_sb(
+    conn: psycopg2.extensions.connection,
+    filter_spec: dict,
+    *,
+    exclude_in_active_campaign: bool = True,
+) -> int:
+    """Count `raw.scraped_leads` matching filter_spec."""
+    where, params = build_filter_where(
+        filter_spec, exclude_in_active_campaign=exclude_in_active_campaign
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM raw.scraped_leads WHERE {where}", params)
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    except Exception as e:
+        st.error(f"Error counting filtered leads: {e}")
+        conn.rollback()
+        return 0
+
+
+def fetch_leads_by_filter_sb(
+    conn: psycopg2.extensions.connection,
+    filter_spec: dict,
+    *,
+    limit: int | None = None,
+    exclude_in_active_campaign: bool = True,
+) -> list[dict]:
+    """Return leads matching filter_spec. Caller controls `limit` (None = all)."""
+    where, params = build_filter_where(
+        filter_spec, exclude_in_active_campaign=exclude_in_active_campaign
+    )
+    cols = ", ".join(_SAMPLE_COLUMNS)
+    sql = f"SELECT {cols} FROM raw.scraped_leads WHERE {where} ORDER BY company_name"
+    bound: list[Any] = list(params)
+    if limit is not None:
+        sql += " LIMIT %s"
+        bound.append(int(limit))
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, bound)
+            rows = cur.fetchall()
+            return [_map_record_to_app(dict(r)) for r in rows]
+    except Exception as e:
+        st.error(f"Error fetching filtered leads: {e}")
+        conn.rollback()
+        return []
+
+
+def create_campaign_record_sb(
+    conn: psycopg2.extensions.connection,
+    *,
+    name: str,
+    filter_spec: dict,
+    instantly_campaign_id: str | None = None,
+    status: str = "draft",
+    created_by: str | None = None,
+) -> str | None:
+    """Insert a row in raw.campaigns. Returns the new id."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO raw.campaigns
+                       (name, filter_spec, instantly_campaign_id, status, created_by)
+                   VALUES (%s, %s::jsonb, %s, %s, %s)
+                   RETURNING id""",
+                (name, psycopg2.extras.Json(filter_spec), instantly_campaign_id,
+                 status, created_by),
+            )
+            new_id = str(cur.fetchone()[0])
+        conn.commit()
+        return new_id
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Failed to record campaign: {e}")
+        return None
+
+
+def list_campaign_records_sb(conn: psycopg2.extensions.connection) -> list[dict]:
+    """List recorded campaigns with their filter_spec for the audit view."""
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, name, filter_spec, instantly_campaign_id,
+                          status, created_by, created_at
+                     FROM raw.campaigns
+                    ORDER BY created_at DESC
+                    LIMIT 200"""
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        st.error(f"Error loading campaign list: {e}")
+        conn.rollback()
+        return []
 
 
 # ── SupabaseBackend class (implements DataBackend protocol) ───────────────
@@ -368,6 +516,49 @@ class SupabaseBackend:
 
     def get_industry_options(self) -> list[str]:
         return INDUSTRY_OPTIONS
+
+    # ── Campaign composer (filter by industry / ticket_tier) ──
+    def fetch_distinct_industries(self) -> list[str]:
+        return fetch_distinct_industries_sb(self.conn)
+
+    def count_leads_by_filter(self, filter_spec: dict, *, exclude_in_active_campaign: bool = True) -> int:
+        return count_leads_by_filter_sb(
+            self.conn, filter_spec,
+            exclude_in_active_campaign=exclude_in_active_campaign,
+        )
+
+    def fetch_leads_by_filter(
+        self,
+        filter_spec: dict,
+        *,
+        limit: int | None = None,
+        exclude_in_active_campaign: bool = True,
+    ) -> list[dict]:
+        return fetch_leads_by_filter_sb(
+            self.conn, filter_spec, limit=limit,
+            exclude_in_active_campaign=exclude_in_active_campaign,
+        )
+
+    def create_campaign_record(
+        self,
+        *,
+        name: str,
+        filter_spec: dict,
+        instantly_campaign_id: str | None = None,
+        status: str = "draft",
+        created_by: str | None = None,
+    ) -> str | None:
+        return create_campaign_record_sb(
+            self.conn,
+            name=name,
+            filter_spec=filter_spec,
+            instantly_campaign_id=instantly_campaign_id,
+            status=status,
+            created_by=created_by,
+        )
+
+    def list_campaign_records(self) -> list[dict]:
+        return list_campaign_records_sb(self.conn)
 
     def get_writable_field_names(self, table_id: str) -> set[str]:
         # All mapped fields are writable (no computed fields in Postgres)

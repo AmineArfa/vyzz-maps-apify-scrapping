@@ -297,7 +297,8 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             api_key,
             campaign_id,
             variables=["postalCode", "jobTitle", "address", "City", "state",
-                       "competitor1", "competitor2", "competitor3", "lid", "industry"],
+                       "competitor1", "competitor2", "competitor3", "lid",
+                       "industry", "ticket_tier"],
             debug=debug,
         )
 
@@ -317,6 +318,9 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
         industry_val = lead.get("industry")
         if isinstance(industry_val, list):
             industry_val = industry_val[0] if industry_val else None
+        ticket_tier_val = lead.get("ticket_tier")
+        if isinstance(ticket_tier_val, list):
+            ticket_tier_val = ticket_tier_val[0] if ticket_tier_val else None
         custom_variables = {
             "postalCode": lead.get("postal_code"),
             "jobTitle": lead.get("key_contact_position"),
@@ -327,6 +331,7 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             "competitor2": lead.get("competitor2"),
             "competitor3": lead.get("competitor3"),
             "industry": industry_val,
+            "ticket_tier": ticket_tier_val,
         }
         
         # Drop empty values to keep payload clean. Also drop NaNs (float) to avoid JSON errors or "nan" strings.

@@ -62,6 +62,9 @@ def _build_patch_payload(
     industry_val = clean_data.get("industry")
     if isinstance(industry_val, list):
         industry_val = industry_val[0] if industry_val else None
+    ticket_tier_val = clean_data.get("ticket_tier")
+    if isinstance(ticket_tier_val, list):
+        ticket_tier_val = ticket_tier_val[0] if ticket_tier_val else None
 
     new_vars = {
         "postalCode": clean_data.get("postal_code"),
@@ -73,6 +76,7 @@ def _build_patch_payload(
         "competitor2": clean_data.get("competitor2"),
         "competitor3": clean_data.get("competitor3"),
         "industry": industry_val,
+        "ticket_tier": ticket_tier_val,
     }
     if instantly_lead_id:
         new_vars["lid"] = instantly_lead_id
