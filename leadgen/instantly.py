@@ -492,39 +492,48 @@ def get_lead_from_instantly(api_key, lead_id, debug=False):
 
 
 def search_lead_by_email(api_key: str, email: str, campaign_id: str | None = None, debug: bool = False):
-    """
-    Search for a lead by email in Instantly.
-    Returns: (lead_dict, error_str) - lead_dict is None if not found or on error.
-    
-    Uses POST /api/v2/leads/list with email filter.
+    """Find a lead by exact email via POST /api/v2/leads/list.
+
+    Returns: (lead_dict, error_str) — lead_dict is None if not found.
+
+    Critical: the v2 API request body has NO `email` field. The previous
+    implementation sent `{"email": ...}` which Instantly silently ignored;
+    the response was the first lead in the account regardless of what we
+    asked for, so reconcile-by-email linked thousands of raw rows to the
+    same arbitrary Instantly lead. The correct field is `contacts: [email]`
+    (per the OpenAPI spec). We additionally verify the returned lead's
+    email matches our query as a defense-in-depth check.
     """
     if not api_key or not email:
         return None, "Missing api_key or email"
 
+    target = email.strip().lower()
     url = f"{BASE_URL}/api/v2/leads/list"
     headers = _headers(api_key)
 
-    # Build search payload
-    payload = {
-        "email": email.strip().lower(),
-        "limit": 1,
+    payload: dict = {
+        "contacts": [target],
+        "limit": 5,
     }
     if campaign_id:
-        payload["campaign_id"] = campaign_id
+        payload["campaign"] = campaign_id
 
     try:
         resp = _request_with_retry("POST", url, headers=headers, json_payload=payload, timeout=20)
         if resp.status_code == 200:
             data = resp.json()
             items = data.get("items", data if isinstance(data, list) else [])
-            if items:
-                lead = items[0]
-                if debug:
-                    st.write(f"🔍 Found existing lead by email: {email} -> {lead.get('id')}")
-                return lead, None
-            # No match found
+            for lead in items:
+                lead_email = (lead.get("email") or "").strip().lower()
+                # Defense-in-depth: drop the response on the floor if the
+                # email doesn't match. A future API rename or a partial
+                # match must never silently link the wrong lead back.
+                if lead_email == target:
+                    if debug:
+                        st.write(f"🔍 Found existing lead by email: {target} -> {lead.get('id')}")
+                    return lead, None
             return None, None
-        err = f"Instantly search lead failed: {resp.status_code} - {resp.text}"
+        err = f"Instantly search lead failed: {resp.status_code} - {resp.text[:200]}"
         if debug:
             st.write(f"⚠️ {err}")
         return None, err
