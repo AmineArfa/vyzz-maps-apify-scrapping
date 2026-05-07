@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 import threading
 
@@ -295,7 +297,8 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             api_key,
             campaign_id,
             variables=["postalCode", "jobTitle", "address", "City", "state",
-                       "competitor1", "competitor2", "competitor3", "lid"],
+                       "competitor1", "competitor2", "competitor3", "lid",
+                       "industry", "ticket_tier"],
             debug=debug,
         )
 
@@ -312,6 +315,12 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
 
         # Instantly v2 supports custom_variables for arbitrary metadata.
         # This is the safest way to store extra fields like postalCode/jobTitle/address/city/state.
+        industry_val = lead.get("industry")
+        if isinstance(industry_val, list):
+            industry_val = industry_val[0] if industry_val else None
+        ticket_tier_val = lead.get("ticket_tier")
+        if isinstance(ticket_tier_val, list):
+            ticket_tier_val = ticket_tier_val[0] if ticket_tier_val else None
         custom_variables = {
             "postalCode": lead.get("postal_code"),
             "jobTitle": lead.get("key_contact_position"),
@@ -321,6 +330,8 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             "competitor1": lead.get("competitor1"),
             "competitor2": lead.get("competitor2"),
             "competitor3": lead.get("competitor3"),
+            "industry": industry_val,
+            "ticket_tier": ticket_tier_val,
         }
         
         # Drop empty values to keep payload clean. Also drop NaNs (float) to avoid JSON errors or "nan" strings.
@@ -535,6 +546,46 @@ def inject_lid_to_lead(api_key, lead_id, debug=False):
             st.write(f"✅ Injected lid={lead_id[:12]}... into lead custom_variables")
         return True, None
     return False, f"Failed to inject lid: {update_err}"
+
+
+def move_lead_to_campaign(api_key, lead_id, campaign_id, debug=False):
+    """Move an existing Instantly lead into `campaign_id`. Idempotent.
+
+    Use this for leads that already have an `instantly_lead_id`: PATCHing
+    `campaign_id` reassigns the existing lead row, which preserves the id
+    on both sides and avoids creating a duplicate. Per-lead campaign
+    membership is the model — Instantly leads belong to one campaign.
+
+    Implemented via the bulk move endpoint (POST /api/v2/leads/move) so
+    the same call works whether the lead was already in `campaign_id`
+    (no-op) or in another one (reassignment).
+    """
+    if not api_key or not lead_id or not campaign_id:
+        return False, "Missing api_key, lead_id, or campaign_id"
+    if not is_valid_uuid(lead_id):
+        return False, f"Invalid Lead ID format: {lead_id}"
+    if not is_valid_uuid(campaign_id):
+        return False, f"Invalid campaign_id format: {campaign_id}"
+
+    url = f"{BASE_URL}/api/v2/leads/move"
+    headers = _headers(api_key)
+    payload = {"ids": [lead_id], "to_campaign_id": campaign_id}
+
+    try:
+        resp = _request_with_retry("POST", url, headers=headers, json_payload=payload, timeout=20)
+        if 200 <= resp.status_code < 300:
+            if debug:
+                st.write(f"➡️ Moved lead {lead_id[:8]}… into campaign {campaign_id[:8]}…")
+            return True, None
+        err = f"Instantly move failed: {resp.status_code} - {resp.text}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
+    except Exception as e:
+        err = f"Instantly move exception: {e}"
+        if debug:
+            st.write(f"⚠️ {err}")
+        return False, err
 
 
 def delete_lead_from_instantly(api_key, lead_id, debug=False):
