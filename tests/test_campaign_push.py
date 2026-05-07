@@ -70,23 +70,28 @@ class PushFlowTests(unittest.TestCase):
         self.assertEqual(upd["fields"]["instantly_lead_id"], existing_id)
         self.assertEqual(upd["fields"]["instantly_campaign_id"], CAMPAIGN_ID)
 
-    def test_bulk_move_chunks_at_100(self):
-        # 250 leads with instantly_lead_id should be moved in 3 chunks
-        # of 100 + 100 + 50, not 250 individual API calls.
+    def test_bulk_move_chunks_at_configured_size(self):
+        # 250 leads with instantly_lead_id should be moved in chunks of
+        # _BULK_MOVE_CHUNK (currently 50) — five chunks of 50, not 250
+        # individual API calls. Throttle sleep is patched out so tests
+        # don't actually wait between chunks.
         backend = _CapturingBackend()
         leads = [{
             "id": f"raw-{i}", "key_contact_email": f"u{i}@x.com",
             "instantly_lead_id": _uuid(100 + i),
         } for i in range(250)]
 
-        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)) as m_bulk:
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)) as m_bulk, \
+                patch.object(campaign_push.time, "sleep"):
             result = campaign_push.push_leads_to_campaign(
                 backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
             )
 
-        self.assertEqual(m_bulk.call_count, 3)
+        expected_chunks = -(-250 // campaign_push._BULK_MOVE_CHUNK)  # ceil
+        self.assertEqual(m_bulk.call_count, expected_chunks)
         chunk_sizes = [len(call.args[1]) for call in m_bulk.call_args_list]
-        self.assertEqual(sorted(chunk_sizes), [50, 100, 100])
+        self.assertEqual(sum(chunk_sizes), 250)
+        self.assertTrue(all(sz <= campaign_push._BULK_MOVE_CHUNK for sz in chunk_sizes))
         self.assertEqual(result["moved"], 250)
         self.assertEqual(len(backend.updates), 250)
 

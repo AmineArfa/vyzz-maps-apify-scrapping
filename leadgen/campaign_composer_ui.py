@@ -251,6 +251,20 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
                     f"📦 Tier '{tier}': {total_to_process} to process "
                     f"({already_skipped} already in place, skipped at SQL)."
                 )
+                # Persist the campaign row up front so an interrupted /
+                # cancelled / timed-out run still leaves an audit record.
+                # ON CONFLICT DO UPDATE makes this safe to call on re-runs.
+                rec_id = backend.create_campaign_record(
+                    name=tier_names[tier],
+                    filter_spec={"type": "ticket_tier", "value": tier},
+                    instantly_campaign_id=c_id,
+                    status="active",
+                    created_by=operator,
+                )
+                if rec_id:
+                    status.write(
+                        f"   • Recorded raw.campaigns row {rec_id[:8]}… for tier '{tier}'."
+                    )
 
             def _on_progress(tier, done, total, phase):
                 if total <= 0:
@@ -278,15 +292,10 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
                 f"Skipped={result['skipped']} Failed={result['failed']}"
             )
 
-            for tier, r in result["by_tier"].items():
-                if r.get("campaign_id"):
-                    backend.create_campaign_record(
-                        name=tier_names[tier],
-                        filter_spec={"type": "ticket_tier", "value": tier},
-                        instantly_campaign_id=r["campaign_id"],
-                        status="active",
-                        created_by=operator,
-                    )
+            # Note: raw.campaigns persistence happens inside _on_tier_start
+            # (right after resolve, before leads processing) so a partially
+            # failed run still leaves an audit row. ON CONFLICT DO UPDATE
+            # keeps this idempotent across re-runs.
 
         cols = st.columns(5)
         cols[0].metric("Moved", result["moved"])

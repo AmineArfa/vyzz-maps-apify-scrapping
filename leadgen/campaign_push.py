@@ -34,7 +34,14 @@ from .instantly import (
 from .ticket_tier import TIERS
 
 
-_BULK_MOVE_CHUNK = 100
+import time
+
+# Conservative chunk size + inter-chunk delay. Empirically 100/call hit
+# Instantly's rate limiter under heavy throughput, dropping whole chunks
+# silently. 50 + 250ms throttle keeps us comfortably under the limit and
+# the SQL filter on re-runs absorbs any chunks that still fail.
+_BULK_MOVE_CHUNK = 50
+_BULK_MOVE_THROTTLE_SEC = 0.25
 
 
 def _normalize_email(value: Any) -> str | None:
@@ -224,6 +231,8 @@ def push_leads_to_campaign(
     for i in range(0, len(to_move), _BULK_MOVE_CHUNK):
         chunk = to_move[i : i + _BULK_MOVE_CHUNK]
         ids = [l["instantly_lead_id"] for l in chunk]
+        if i > 0 and _BULK_MOVE_THROTTLE_SEC > 0:
+            time.sleep(_BULK_MOVE_THROTTLE_SEC)
         ok, err = bulk_move_leads_to_campaign(api_key, ids, campaign_id, debug=debug)
         if ok:
             for lead in chunk:

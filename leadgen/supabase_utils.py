@@ -467,13 +467,25 @@ def create_campaign_record_sb(
     status: str = "draft",
     created_by: str | None = None,
 ) -> str | None:
-    """Insert a row in raw.campaigns. Returns the new id."""
+    """Insert (or refresh) a row in raw.campaigns. Returns the row id.
+
+    Idempotent on `instantly_campaign_id`: the recategorize flow now persists
+    the row right after resolving the campaign, before processing any leads,
+    so a partially-failed or operator-cancelled run still leaves an audit
+    record. Re-running the flow updates filter_spec / status / name in place
+    rather than failing on the UNIQUE constraint.
+    """
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO raw.campaigns
                        (name, filter_spec, instantly_campaign_id, status, created_by)
                    VALUES (%s, %s::jsonb, %s, %s, %s)
+                   ON CONFLICT (instantly_campaign_id) DO UPDATE SET
+                       name        = EXCLUDED.name,
+                       filter_spec = EXCLUDED.filter_spec,
+                       status      = EXCLUDED.status,
+                       updated_at  = now()
                    RETURNING id""",
                 (name, psycopg2.extras.Json(filter_spec), instantly_campaign_id,
                  status, created_by),
