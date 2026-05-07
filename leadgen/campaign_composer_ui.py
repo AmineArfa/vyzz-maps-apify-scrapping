@@ -15,11 +15,10 @@ import pandas as pd
 import streamlit as st
 
 from .campaign_filter import FilterSpecError, describe, spec_from_picker
+from .campaign_push import push_leads_to_campaign
 from .instantly import (
     _list_all_campaigns,
-    export_leads_to_instantly,
     find_or_create_instantly_campaign,
-    inject_lid_to_lead,
     is_valid_uuid,
     reset_campaign_cache,
 )
@@ -86,7 +85,12 @@ def _push_to_campaign(
     operator: str | None,
     debug: bool,
 ) -> dict:
-    """Create or pick an Instantly campaign, push leads, then persist the row."""
+    """Resolve the Instantly campaign id, push, then persist the campaign row.
+
+    Splits the work between MOVE (existing instantly_lead_id) and CREATE
+    (no id yet), preserves the lead id in both cases, and writes the
+    resulting id back to raw.scraped_leads so the row stays linked.
+    """
     api_key = secrets.get("instantly_key")
     if not api_key:
         return {"ok": False, "error": "Instantly API key missing"}
@@ -100,14 +104,9 @@ def _push_to_campaign(
         if not c_id:
             return {"ok": False, "error": f"Failed to create Instantly campaign '{campaign_name}'"}
 
-    cnt, created, _, err = export_leads_to_instantly(api_key, c_id, leads, debug=debug)
-    if err and cnt == 0:
-        return {"ok": False, "error": err}
-
-    for c in created or []:
-        new_id = c.get("id")
-        if new_id and is_valid_uuid(new_id):
-            inject_lid_to_lead(api_key, new_id, debug=debug)
+    push_result = push_leads_to_campaign(
+        backend, api_key=api_key, leads=leads, campaign_id=c_id, debug=debug,
+    )
 
     record_id = backend.create_campaign_record(
         name=campaign_name,
@@ -120,9 +119,9 @@ def _push_to_campaign(
     return {
         "ok": True,
         "instantly_campaign_id": c_id,
-        "instantly_added": cnt,
         "campaign_record_id": record_id,
-        "warning": err,
+        **{k: v for k, v in push_result.items() if k != "details"},
+        "details": push_result["details"],
     }
 
 
@@ -235,16 +234,37 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
             )
 
         if result.get("ok"):
-            warn = result.get("warning")
-            msg = (
-                f"✅ Added **{result['instantly_added']}** leads to Instantly "
-                f"campaign `{result['instantly_campaign_id']}`. "
+            cols = st.columns(4)
+            cols[0].metric("Moved", result.get("moved", 0))
+            cols[1].metric("Created", result.get("created", 0))
+            cols[2].metric("Skipped", result.get("skipped", 0))
+            cols[3].metric("Failed", result.get("failed", 0))
+            st.success(
+                f"Pushed to Instantly campaign `{result['instantly_campaign_id']}`. "
                 f"Filter recorded as `raw.campaigns.id = {result['campaign_record_id']}`."
             )
-            if warn:
-                st.warning(f"{msg}\n\nNon-fatal warning: {warn}")
-            else:
-                st.success(msg)
+            details = result.get("details") or []
+            if details:
+                with st.expander("Per-lead details", expanded=False):
+                    rows = [{
+                        "op": d["op"],
+                        "email": d.get("email") or "—",
+                        "company": d.get("company_name") or "—",
+                        "industry": d.get("industry") or "—",
+                        "tier": d.get("ticket_tier") or "—",
+                        "instantly_lead_id": (
+                            (d["instantly_lead_id"][:8] + "…")
+                            if d.get("instantly_lead_id") else "—"
+                        ),
+                        "error": d.get("error") or "",
+                    } for d in details]
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "ℹ️ Industry change is **not** auto-recomputed on `ticket_tier`. "
+                "If an operator updates `industry` on a row that already has a "
+                "`ticket_tier`, the existing tier is preserved — use a future "
+                "explicit 'recompute tier' admin action to override."
+            )
         else:
             st.error(f"❌ {result.get('error')}")
 
