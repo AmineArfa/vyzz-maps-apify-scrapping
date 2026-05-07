@@ -369,6 +369,24 @@ _SAMPLE_COLUMNS = (
 )
 
 
+def count_leads_without_tier_sb(conn: psycopg2.extensions.connection) -> int:
+    """Count leads with `ticket_tier IS NULL` — they won't appear in any
+    tier-segmented campaign filter, so the operator should know how many
+    rows are sitting outside the recategorization."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM raw.scraped_leads "
+                "WHERE ticket_tier IS NULL OR ticket_tier = ''"
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    except Exception as e:
+        st.error(f"Error counting tier-less leads: {e}")
+        conn.rollback()
+        return 0
+
+
 def fetch_distinct_industries_sb(conn: psycopg2.extensions.connection) -> list[str]:
     """Return the distinct, non-null industries currently in raw.scraped_leads."""
     try:
@@ -520,6 +538,9 @@ class SupabaseBackend:
     # ── Campaign composer (filter by industry / ticket_tier) ──
     def fetch_distinct_industries(self) -> list[str]:
         return fetch_distinct_industries_sb(self.conn)
+
+    def count_leads_without_tier(self) -> int:
+        return count_leads_without_tier_sb(self.conn)
 
     def count_leads_by_filter(self, filter_spec: dict, *, exclude_in_active_campaign: bool = True) -> int:
         return count_leads_by_filter_sb(

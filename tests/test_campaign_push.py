@@ -194,6 +194,85 @@ class PushFlowTests(unittest.TestCase):
         self.assertEqual(ids_written, ["raw-A", "raw-B"])
 
 
+class RecategorizeAllTests(unittest.TestCase):
+    """recategorize_all_by_tier loops the three tiers and aggregates."""
+
+    def _make_backend(self, leads_by_tier):
+        captured = {"updates": [], "fetched": []}
+
+        class _B:
+            def fetch_leads_by_filter(self, spec, *, limit=None, exclude_in_active_campaign=True):
+                captured["fetched"].append((spec, exclude_in_active_campaign))
+                return list(leads_by_tier.get(spec["value"], []))
+
+            def batch_update(self, updates):
+                captured["updates"].extend(updates)
+                return True
+
+        return _B(), captured
+
+    def test_iterates_three_tiers_with_full_set(self):
+        # exclude_in_active_campaign must be False so already-in-campaign
+        # leads get moved. That's the whole point of recategorization.
+        leads_by_tier = {
+            "low": [{"id": "l1", "key_contact_email": "l@x.com", "instantly_lead_id": _uuid(10)}],
+            "mid": [{"id": "m1", "key_contact_email": "m@x.com", "instantly_lead_id": _uuid(11)}],
+            "high": [{"id": "h1", "key_contact_email": "h@x.com", "instantly_lead_id": _uuid(12)}],
+        }
+        backend, captured = self._make_backend(leads_by_tier)
+        camp_ids = {"low": _uuid(20), "mid": _uuid(21), "high": _uuid(22)}
+
+        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)):
+            result = campaign_push.recategorize_all_by_tier(
+                backend, api_key="k",
+                resolve_campaign_id=lambda t: camp_ids[t],
+                max_workers=1,
+            )
+
+        # All three tier filters were applied.
+        seen_specs = [s for s, _ in captured["fetched"]]
+        self.assertEqual(
+            sorted(s["value"] for s in seen_specs),
+            ["high", "low", "mid"],
+        )
+        # Each filter call disabled exclude_in_active_campaign.
+        self.assertTrue(all(not excl for _, excl in captured["fetched"]))
+
+        self.assertEqual(result["moved"], 3)
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(set(result["by_tier"].keys()), {"low", "mid", "high"})
+        for tier, c_id in camp_ids.items():
+            self.assertEqual(result["by_tier"][tier]["campaign_id"], c_id)
+            self.assertEqual(result["by_tier"][tier]["moved"], 1)
+
+    def test_unresolved_campaign_records_error_does_not_block_others(self):
+        # If a tier's campaign can't be resolved, we record the error but
+        # keep going with the remaining tiers — partial recategorization
+        # is better than nothing.
+        leads_by_tier = {
+            "low": [{"id": "l1", "key_contact_email": "l@x.com", "instantly_lead_id": _uuid(13)}],
+            "mid": [],
+            "high": [{"id": "h1", "key_contact_email": "h@x.com", "instantly_lead_id": _uuid(14)}],
+        }
+        backend, _ = self._make_backend(leads_by_tier)
+        camp_ids = {"low": _uuid(23), "mid": None, "high": _uuid(24)}
+
+        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)):
+            result = campaign_push.recategorize_all_by_tier(
+                backend, api_key="k",
+                resolve_campaign_id=lambda t: camp_ids.get(t),
+                max_workers=1,
+            )
+
+        self.assertEqual(result["moved"], 2)
+        self.assertIsNone(result["by_tier"]["mid"]["campaign_id"])
+        self.assertIn("could not resolve campaign", result["by_tier"]["mid"]["error"])
+        # Other two tiers still completed.
+        self.assertEqual(result["by_tier"]["low"]["moved"], 1)
+        self.assertEqual(result["by_tier"]["high"]["moved"], 1)
+
+
 class MoveLeadHelperTests(unittest.TestCase):
     """The move_lead_to_campaign HTTP helper — argument validation."""
 

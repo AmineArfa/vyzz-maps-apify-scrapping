@@ -15,7 +15,7 @@ import pandas as pd
 import streamlit as st
 
 from .campaign_filter import FilterSpecError, describe, spec_from_picker
-from .campaign_push import push_leads_to_campaign
+from .campaign_push import push_leads_to_campaign, recategorize_all_by_tier
 from .instantly import (
     _list_all_campaigns,
     find_or_create_instantly_campaign,
@@ -123,6 +123,129 @@ def _push_to_campaign(
         **{k: v for k, v in push_result.items() if k != "details"},
         "details": push_result["details"],
     }
+
+
+def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
+    """One-click: re-route every lead into a tier-segmented campaign.
+
+    Existing leads are MOVED via Instantly's bulk move endpoint, which
+    preserves `instantly_lead_id`, `lid`, and every other custom_variable.
+    New leads are CREATED with the merge fields and the new id is written
+    back to `raw.scraped_leads`. Leads with NULL `ticket_tier` are not in
+    any tier filter and stay where they are.
+    """
+    st.subheader("⚡ Recategorize all leads by tier")
+    st.caption(
+        "Push every lead with a `ticket_tier` into its tier-segmented "
+        "campaign in one click. Existing leads are moved (lid preserved); "
+        "new leads are created with the merge fields. Leads without a tier "
+        "are left untouched."
+    )
+
+    name_template = st.text_input(
+        "Campaign name template",
+        value="{tier_title} Tier - Cold Outreach",
+        help="`{tier}` = low/mid/high lowercase, `{tier_title}` = capitalized.",
+        key="recat_name_template",
+    )
+
+    tier_counts: dict[str, int] = {}
+    tier_names: dict[str, str] = {}
+    for tier in TIERS:
+        tier_counts[tier] = backend.count_leads_by_filter(
+            {"type": "ticket_tier", "value": tier},
+            exclude_in_active_campaign=False,
+        )
+        try:
+            tier_names[tier] = name_template.format(
+                tier=tier, tier_title=tier.title(),
+            )
+        except (KeyError, IndexError):
+            st.error("Template must use only `{tier}` and `{tier_title}`.")
+            return
+
+    tier_less = backend.count_leads_without_tier()
+
+    preview_rows = [{
+        "tier": t,
+        "count": tier_counts[t],
+        "campaign": tier_names[t],
+    } for t in TIERS]
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+    if tier_less:
+        st.caption(
+            f"⚠️ {tier_less} leads have NULL `ticket_tier` and won't be "
+            "recategorized. Set their `industry` to populate the tier first."
+        )
+
+    confirmed = st.checkbox(
+        "I understand this will move leads across campaigns in Instantly.",
+        key="recat_confirm",
+    )
+
+    if st.button(
+        "🚀 Run recategorization",
+        type="primary",
+        disabled=not confirmed or sum(tier_counts.values()) == 0,
+        key="recat_run_btn",
+    ):
+        api_key = secrets.get("instantly_key")
+        if not api_key:
+            st.error("Instantly API key missing.")
+            return
+        operator = secrets.get("operator_email") or "operator"
+
+        with st.status("Recategorizing all leads by tier...", expanded=True) as status:
+            reset_campaign_cache()
+
+            def _resolve(tier: str) -> str | None:
+                name = tier_names[tier]
+                status.write(f"Resolving Instantly campaign '{name}'...")
+                return find_or_create_instantly_campaign(api_key, name, debug=debug)
+
+            result = recategorize_all_by_tier(
+                backend, api_key=api_key, resolve_campaign_id=_resolve, debug=debug,
+            )
+
+            for tier, r in result["by_tier"].items():
+                if r.get("campaign_id"):
+                    backend.create_campaign_record(
+                        name=tier_names[tier],
+                        filter_spec={"type": "ticket_tier", "value": tier},
+                        instantly_campaign_id=r["campaign_id"],
+                        status="active",
+                        created_by=operator,
+                    )
+
+        cols = st.columns(4)
+        cols[0].metric("Moved", result["moved"])
+        cols[1].metric("Created", result["created"])
+        cols[2].metric("Skipped", result["skipped"])
+        cols[3].metric("Failed", result["failed"])
+
+        per_tier_rows = [{
+            "tier": t,
+            "campaign": tier_names[t],
+            "moved": result["by_tier"][t].get("moved", 0),
+            "created": result["by_tier"][t].get("created", 0),
+            "skipped": result["by_tier"][t].get("skipped", 0),
+            "failed": result["by_tier"][t].get("failed", 0),
+            "error": result["by_tier"][t].get("error") or "",
+        } for t in TIERS]
+        st.dataframe(pd.DataFrame(per_tier_rows), use_container_width=True, hide_index=True)
+
+        if result["failed"]:
+            failures = [
+                d for r in result["by_tier"].values()
+                for d in r.get("details", []) if d.get("op") == "failed"
+            ]
+            with st.expander(f"❌ {result['failed']} failures", expanded=False):
+                rows = [{
+                    "tier": d.get("ticket_tier"),
+                    "email": d.get("email"),
+                    "error": d.get("error"),
+                } for d in failures]
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> None:
@@ -267,6 +390,9 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
             )
         else:
             st.error(f"❌ {result.get('error')}")
+
+    st.divider()
+    _render_recategorize_section(backend, secrets, debug_mode)
 
     st.divider()
     st.subheader("📚 Recorded campaigns")

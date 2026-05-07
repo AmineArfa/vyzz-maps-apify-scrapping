@@ -30,6 +30,7 @@ from .instantly import (
     move_lead_to_campaign,
     search_lead_by_email,
 )
+from .ticket_tier import TIERS
 
 
 def _normalize_email(value: Any) -> str | None:
@@ -161,3 +162,59 @@ def push_leads_to_campaign(
         counts[r["op"]] = counts.get(r["op"], 0) + 1
     counts["details"] = results
     return counts
+
+
+def recategorize_all_by_tier(
+    backend,
+    *,
+    api_key: str,
+    resolve_campaign_id,
+    debug: bool = False,
+    max_workers: int = 5,
+) -> dict:
+    """One-click: re-route every lead in raw.scraped_leads into its tier campaign.
+
+    Iterates LOW → MID → HIGH. For each tier:
+      1. Resolve the target Instantly campaign id via `resolve_campaign_id(tier)`
+         (caller decides find-or-create policy and naming).
+      2. Pull every matching lead — including leads already in another active
+         campaign — because the whole point is to reassign.
+      3. Run the standard push machinery: existing leads MOVE (preserving
+         instantly_lead_id and lid), new leads CREATE + writeback.
+
+    Leads with `ticket_tier IS NULL` are not included in any tier filter, so
+    they stay in their current campaign untouched. The operator should fix
+    `industry` on those rows first if they want them recategorized.
+    """
+    by_tier: dict[str, dict] = {}
+    for tier in TIERS:
+        c_id = resolve_campaign_id(tier)
+        if not c_id or not is_valid_uuid(c_id):
+            by_tier[tier] = {
+                "tier": tier,
+                "campaign_id": None,
+                "moved": 0, "created": 0, "skipped": 0, "failed": 0,
+                "details": [],
+                "error": f"could not resolve campaign for tier '{tier}'",
+            }
+            continue
+
+        spec = {"type": "ticket_tier", "value": tier}
+        leads = backend.fetch_leads_by_filter(
+            spec, exclude_in_active_campaign=False,
+        )
+        push_result = push_leads_to_campaign(
+            backend, api_key=api_key, leads=leads,
+            campaign_id=c_id, debug=debug, max_workers=max_workers,
+        )
+        push_result["tier"] = tier
+        push_result["campaign_id"] = c_id
+        push_result["error"] = None
+        by_tier[tier] = push_result
+
+    aggregated = {"moved": 0, "created": 0, "skipped": 0, "failed": 0}
+    for r in by_tier.values():
+        for k in aggregated:
+            aggregated[k] += r.get(k, 0)
+    aggregated["by_tier"] = by_tier
+    return aggregated
