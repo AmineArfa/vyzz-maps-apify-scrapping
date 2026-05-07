@@ -223,95 +223,119 @@ def reset_campaign_cache():
         _campaign_cache_loaded = False
 
 
-def find_or_create_instantly_campaign(api_key, campaign_name, debug=False):
+def _search_campaign_by_exact_name(api_key, campaign_name, log=None):
+    """Single-page search for a campaign by exact name. Returns id or None.
+
+    No pagination loop — one HTTP request bounded by the underlying
+    timeout/retry policy. The pagination loop is what made the previous
+    implementation appear to hang for minutes when Instantly's response
+    didn't shape pagination as expected.
     """
-    Finds a campaign by name or creates it. Returns: campaign_id or None.
-    
-    Uses a module-level lock and cache to GUARANTEE no duplicate campaigns
-    are created, even when called from multiple threads simultaneously.
+    headers = _headers(api_key)
+    url = f"{BASE_URL}/api/v2/campaigns"
+    try:
+        resp = _request_with_retry(
+            "GET", url, headers=headers,
+            params={"search": campaign_name, "limit": 50},
+            timeout=15,
+        )
+    except Exception as e:
+        if log:
+            log(f"⚠️ Search failed: {e}")
+        return None
+    if resp.status_code != 200:
+        if log:
+            log(f"⚠️ Search HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+    payload = resp.json()
+    items = payload.get("items", payload if isinstance(payload, list) else [])
+    if log:
+        log(f"🔎 Search returned {len(items)} candidate(s) for '{campaign_name}'.")
+    for c in items:
+        if c.get("name") == campaign_name:
+            return c.get("id")
+    return None
+
+
+def find_or_create_instantly_campaign(api_key, campaign_name, debug=False, log=None):
+    """Find a campaign by exact name or create it. Returns campaign_id or None.
+
+    Bounded path:
+      1. Cache hit  → instant.
+      2. Single-page search by name → if exact match, cache + return.
+      3. Create     → on success cache + return; on race (already exists),
+                      retry the search to recover the id.
+
+    `log` is an optional callable that receives one-line status updates so
+    callers can render progress in a Streamlit st.status block. `debug` is
+    kept as a backwards-compatible shortcut that routes the same messages
+    to st.write when no callback is provided.
     """
-    global _campaign_cache_loaded
-    
     if not api_key:
         return None
 
+    def _log(msg: str) -> None:
+        if log is not None:
+            try:
+                log(msg)
+            except Exception:
+                pass
+        elif debug:
+            try:
+                st.write(msg)
+            except Exception:
+                pass
+
     headers = _headers(api_key)
 
-    # Use module-level lock to ensure only one thread can create campaigns at a time
     with _campaign_cache_lock:
-        # Step 1: Check in-memory cache first (instant, no API call)
+        # 1. Cache hit
         if campaign_name in _campaign_cache:
-            if debug:
-                st.write(f"✅ Found campaign in cache: {campaign_name}")
+            _log(f"✅ Cache hit: '{campaign_name}'")
             return _campaign_cache[campaign_name]
 
-        # Step 2a: Fast path — search by exact name. The full-list scan
-        # is expensive (cursor pagination over the whole account), so try
-        # a targeted search first. Only falls through to a full load if
-        # the search itself fails.
-        try:
-            results = _list_all_campaigns(api_key, debug=debug, search=campaign_name)
-        except Exception:
-            results = None
-        if results is not None:
-            for c in results:
-                name = c.get("name")
-                cid = c.get("id")
-                if name and cid:
-                    _campaign_cache[name] = cid
-            if campaign_name in _campaign_cache:
-                if debug:
-                    st.write(f"✅ Found campaign via search: {campaign_name}")
-                return _campaign_cache[campaign_name]
-            # Search returned no exact-name match — safe to create.
-            # We do NOT mark the cache as fully loaded since search is
-            # name-scoped; a different name might still exist server-side.
+        # 2. Search by exact name (single page)
+        _log(f"🔎 Searching Instantly for '{campaign_name}'...")
+        existing_id = _search_campaign_by_exact_name(api_key, campaign_name, log=_log)
+        if existing_id:
+            _campaign_cache[campaign_name] = existing_id
+            _log(f"✅ Found existing: {existing_id}")
+            return existing_id
 
-        # Step 2b: Full load fallback (only when search itself errored).
-        if results is None and not _campaign_cache_loaded:
-            campaigns = _list_all_campaigns(api_key, debug=debug)
-            if campaigns is None:
-                if debug:
-                    st.write(f"❌ Cannot verify if campaign '{campaign_name}' exists - aborting to prevent duplicates")
-                return None
-
-            for c in campaigns:
-                name = c.get("name")
-                cid = c.get("id")
-                if name and cid:
-                    _campaign_cache[name] = cid
-
-            _campaign_cache_loaded = True
-            if debug:
-                st.write(f"📋 Loaded {len(_campaign_cache)} existing campaigns into cache")
-
-            if campaign_name in _campaign_cache:
-                if debug:
-                    st.write(f"✅ Found campaign after loading cache: {campaign_name}")
-                return _campaign_cache[campaign_name]
-        
-        # Step 3: Campaign definitely doesn't exist - create it
-        # We're still inside the lock, so no other thread can create it simultaneously
+        # 3. Create
+        _log(f"➕ Creating new campaign '{campaign_name}'...")
         try:
             url = f"{BASE_URL}/api/v2/campaigns"
             data = {"name": campaign_name, "campaign_schedule": _default_campaign_schedule()}
-            resp = _request_with_retry("POST", url, headers=headers, json_payload=data, timeout=30)
-            if resp.status_code == 200:
-                new_c = resp.json()
-                c_id = new_c.get("id") or new_c.get("data", {}).get("id")
-                if c_id:
-                    # Immediately add to cache BEFORE releasing lock
-                    _campaign_cache[campaign_name] = c_id
-                    if debug:
-                        st.write(f"✅ Created new campaign: {campaign_name} ({c_id})")
-                    return c_id
-            if debug:
-                st.write(f"❌ Campaign create failed: {resp.status_code} - {resp.text}")
+            resp = _request_with_retry(
+                "POST", url, headers=headers, json_payload=data, timeout=20,
+            )
         except Exception as e:
-            if debug:
-                st.write(f"⚠️ Failed to create campaign: {e}")
+            _log(f"⚠️ Create exception: {e}")
+            return None
 
-    return None
+        if 200 <= resp.status_code < 300:
+            new_c = resp.json()
+            c_id = new_c.get("id") or new_c.get("data", {}).get("id")
+            if c_id:
+                _campaign_cache[campaign_name] = c_id
+                _log(f"✅ Created: {c_id}")
+                return c_id
+            _log(f"⚠️ Create returned {resp.status_code} but no id: {resp.text[:200]}")
+            return None
+
+        # Race: a concurrent caller created it between our search and create.
+        # Recover the id with a second search instead of returning None.
+        if resp.status_code in (400, 409, 422):
+            _log(f"⚠️ Create rejected ({resp.status_code}); re-searching for race recovery.")
+            recovered = _search_campaign_by_exact_name(api_key, campaign_name, log=_log)
+            if recovered:
+                _campaign_cache[campaign_name] = recovered
+                _log(f"✅ Recovered after race: {recovered}")
+                return recovered
+
+        _log(f"❌ Create failed {resp.status_code}: {resp.text[:200]}")
+        return None
 
 
 def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
