@@ -41,14 +41,29 @@ def _classify_error(err: str | None) -> str:
     return "other"
 
 
-def _build_patch_payload(clean_data: dict, instantly_lead_id: str | None = None) -> dict:
-    """Build a PATCH payload from clean_data."""
+def _build_patch_payload(
+    clean_data: dict,
+    instantly_lead_id: str | None = None,
+    existing_custom_variables: dict | None = None,
+) -> dict:
+    """Build a PATCH payload from clean_data.
+
+    Instantly's PATCH replaces the entire ``custom_variables`` dict, so callers
+    must pass ``existing_custom_variables`` (fetched via get_lead_from_instantly)
+    to preserve any keys we don't manage here. Our values take precedence on
+    conflict; keys we omit (e.g. industry when source is null) are kept from
+    the existing dict rather than dropped.
+    """
     raw_name = clean_data.get("key_contact_name", "")
     name_parts = str(raw_name).split(" ")
     first_name = name_parts[0] if name_parts else ""
     last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
 
-    custom_vars = {
+    industry_val = clean_data.get("industry")
+    if isinstance(industry_val, list):
+        industry_val = industry_val[0] if industry_val else None
+
+    new_vars = {
         "postalCode": clean_data.get("postal_code"),
         "jobTitle": clean_data.get("key_contact_position"),
         "address": clean_data.get("postal_address"),
@@ -57,11 +72,13 @@ def _build_patch_payload(clean_data: dict, instantly_lead_id: str | None = None)
         "competitor1": clean_data.get("competitor1"),
         "competitor2": clean_data.get("competitor2"),
         "competitor3": clean_data.get("competitor3"),
+        "industry": industry_val,
     }
-    # Preserve lid for closed-loop tracking ({{lid}} merge variable in email templates)
     if instantly_lead_id:
-        custom_vars["lid"] = instantly_lead_id
-    custom_vars = {k: v for k, v in custom_vars.items() if v not in (None, "", [], {})}
+        new_vars["lid"] = instantly_lead_id
+    new_vars = {k: v for k, v in new_vars.items() if v not in (None, "", [], {})}
+
+    merged_vars = {**(existing_custom_variables or {}), **new_vars}
 
     return sanitize_for_json({
         "email": clean_data.get("key_contact_email"),
@@ -70,7 +87,7 @@ def _build_patch_payload(clean_data: dict, instantly_lead_id: str | None = None)
         "company_name": clean_data.get("company_name"),
         "website": clean_data.get("website"),
         "phone": clean_data.get("generic_phone"),
-        "custom_variables": custom_vars or None,
+        "custom_variables": merged_vars or None,
     })
 
 
@@ -154,9 +171,19 @@ def _process_single_lead(lead: dict, *, secrets: dict, debug_mode: bool):
             email_matches = inst_email and inst_email == email
             
             if lead_exists_in_instantly and email_matches:
-                # A1a: Lead exists and email matches -> PATCH update
+                # A1a: Lead exists and email matches -> PATCH update.
+                # Pass existing custom_variables (Instantly returns them under
+                # "payload") so the merge in _build_patch_payload preserves
+                # any keys we don't manage here.
                 operation = "Update"
-                patch_payload = _build_patch_payload(clean_data, instantly_lead_id=lead_id_instantly)
+                existing_vars = inst_lead.get("payload") if isinstance(inst_lead, dict) else None
+                if not isinstance(existing_vars, dict):
+                    existing_vars = {}
+                patch_payload = _build_patch_payload(
+                    clean_data,
+                    instantly_lead_id=lead_id_instantly,
+                    existing_custom_variables=existing_vars,
+                )
                 success, err = update_lead_in_instantly(api_key, lead_id_instantly, patch_payload, debug=debug_mode)
 
                 if not success:
