@@ -124,47 +124,66 @@ def ensure_campaign_variables(api_key: str, campaign_id: str, variables: list[st
         return False, err
 
 
-def _list_all_campaigns(api_key, debug=False):
+def _list_all_campaigns(api_key, debug=False, search=None):
     """
-    Fetch ALL campaigns with pagination.
+    Fetch campaigns with cursor pagination.
+
+    Instantly v2 uses `starting_after` (the id of the last item on the
+    previous page), NOT `skip`. Passing `skip` is silently ignored, so
+    every page returns the same first batch — the loop then spins until
+    max_pages × per-request timeout, which looks like a hang.
+
+    `search` (optional) narrows the listing by campaign name. The cold-
+    cache lookup in find_or_create can use this fast-path to fetch only
+    the few campaigns matching a known name instead of the entire account.
+
     Returns list of campaign dicts, or None on failure.
     """
     headers = _headers(api_key)
     url = f"{BASE_URL}/api/v2/campaigns"
-    all_campaigns = []
-    skip = 0
+    all_campaigns: list[dict] = []
+    starting_after: str | None = None
     limit = 100
-    max_pages = 50  # Safety limit: 5000 campaigns max
-    
+    max_pages = 50  # safety: ~5000 campaigns
+
     for _ in range(max_pages):
         try:
+            params: dict = {"limit": limit}
+            if starting_after:
+                params["starting_after"] = starting_after
+            if search:
+                params["search"] = search
             resp = _request_with_retry(
-                "GET", url, headers=headers, 
-                params={"limit": limit, "skip": skip}, 
-                timeout=20
+                "GET", url, headers=headers, params=params, timeout=20,
             )
             if resp.status_code != 200:
                 if debug:
                     st.write(f"⚠️ Campaign list failed: {resp.status_code}")
-                return None  # Fail - don't risk creating duplicates
-            
+                return None
+
             payload = resp.json()
             items = payload.get("items", payload if isinstance(payload, list) else [])
             if not items:
-                break  # No more pages
-            
-            all_campaigns.extend(items)
-            skip += limit
-            
-            # If we got fewer than limit, we're done
-            if len(items) < limit:
                 break
-                
+
+            all_campaigns.extend(items)
+
+            # Page short OR no next cursor → done.
+            next_cursor = payload.get("next_starting_after")
+            if next_cursor:
+                starting_after = next_cursor
+            elif len(items) < limit:
+                break
+            else:
+                starting_after = items[-1].get("id")
+                if not starting_after:
+                    break
+
         except Exception as e:
             if debug:
                 st.write(f"⚠️ Campaign list exception: {e}")
-            return None  # Fail - don't risk creating duplicates
-    
+            return None
+
     return all_campaigns
 
 
@@ -225,26 +244,47 @@ def find_or_create_instantly_campaign(api_key, campaign_name, debug=False):
             if debug:
                 st.write(f"✅ Found campaign in cache: {campaign_name}")
             return _campaign_cache[campaign_name]
-        
-        # Step 2: If cache not loaded yet, load it now
-        if not _campaign_cache_loaded:
+
+        # Step 2a: Fast path — search by exact name. The full-list scan
+        # is expensive (cursor pagination over the whole account), so try
+        # a targeted search first. Only falls through to a full load if
+        # the search itself fails.
+        try:
+            results = _list_all_campaigns(api_key, debug=debug, search=campaign_name)
+        except Exception:
+            results = None
+        if results is not None:
+            for c in results:
+                name = c.get("name")
+                cid = c.get("id")
+                if name and cid:
+                    _campaign_cache[name] = cid
+            if campaign_name in _campaign_cache:
+                if debug:
+                    st.write(f"✅ Found campaign via search: {campaign_name}")
+                return _campaign_cache[campaign_name]
+            # Search returned no exact-name match — safe to create.
+            # We do NOT mark the cache as fully loaded since search is
+            # name-scoped; a different name might still exist server-side.
+
+        # Step 2b: Full load fallback (only when search itself errored).
+        if results is None and not _campaign_cache_loaded:
             campaigns = _list_all_campaigns(api_key, debug=debug)
             if campaigns is None:
                 if debug:
                     st.write(f"❌ Cannot verify if campaign '{campaign_name}' exists - aborting to prevent duplicates")
                 return None
-            
+
             for c in campaigns:
                 name = c.get("name")
                 cid = c.get("id")
                 if name and cid:
                     _campaign_cache[name] = cid
-            
+
             _campaign_cache_loaded = True
             if debug:
                 st.write(f"📋 Loaded {len(_campaign_cache)} existing campaigns into cache")
-            
-            # Check again after loading
+
             if campaign_name in _campaign_cache:
                 if debug:
                     st.write(f"✅ Found campaign after loading cache: {campaign_name}")
