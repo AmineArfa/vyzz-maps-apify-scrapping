@@ -236,22 +236,44 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
         with st.status("Recategorizing all leads by tier...", expanded=True) as status:
             reset_campaign_cache()
 
+            progress_bar = st.progress(0.0, text="Starting...")
+            last_phase = {"value": ""}
+
             def _resolve(tier: str) -> str | None:
                 name = tier_names[tier]
                 status.write(f"━━━ Tier '{tier}' → '{name}' ━━━")
-                # Pass status.write as the log callback so every internal
-                # step (cache check, search, create, race recovery) is
-                # visible. Previously a hung resolver showed only "Resolving…"
-                # with no insight into which call was actually blocking.
                 return find_or_create_instantly_campaign(
                     api_key, name, log=status.write, debug=debug,
                 )
 
+            def _on_tier_start(tier, total_to_process, already_skipped, c_id):
+                status.write(
+                    f"📦 Tier '{tier}': {total_to_process} to process "
+                    f"({already_skipped} already in place, skipped at SQL)."
+                )
+
+            def _on_progress(tier, done, total, phase):
+                if total <= 0:
+                    return
+                pct = min(done / total, 1.0)
+                progress_bar.progress(
+                    pct,
+                    text=f"[{tier}] {phase}: {done}/{total}",
+                )
+                # Only emit a status line on phase transitions to avoid
+                # spamming the log with one entry per processed lead.
+                marker = f"{tier}:{phase}"
+                if marker != last_phase["value"]:
+                    status.write(f"   • {phase} phase started for tier '{tier}' ({total} leads)")
+                    last_phase["value"] = marker
+
             result = recategorize_all_by_tier(
                 backend, api_key=api_key, resolve_campaign_id=_resolve, debug=debug,
+                on_tier_start=_on_tier_start, on_progress=_on_progress,
             )
+            progress_bar.progress(1.0, text="Done.")
             status.write(
-                f"Done. Moved={result['moved']} Created={result['created']} "
+                f"✅ Done. Moved={result['moved']} Created={result['created']} "
                 f"AlreadyInPlace={result.get('already_in_place', 0)} "
                 f"Skipped={result['skipped']} Failed={result['failed']}"
             )

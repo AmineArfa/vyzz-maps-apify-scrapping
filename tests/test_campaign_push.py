@@ -40,7 +40,7 @@ CAMPAIGN_ID = _uuid(1)
 
 
 class PushFlowTests(unittest.TestCase):
-    def test_existing_lead_is_moved_not_created(self):
+    def test_existing_lead_is_bulk_moved_not_created(self):
         backend = _CapturingBackend()
         existing_id = _uuid(2)
         leads = [{
@@ -52,13 +52,13 @@ class PushFlowTests(unittest.TestCase):
             "instantly_lead_id": existing_id,
         }]
 
-        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)) as m_move, \
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)) as m_bulk, \
                 patch.object(campaign_push, "export_leads_to_instantly") as m_create:
             result = campaign_push.push_leads_to_campaign(
                 backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
             )
 
-        m_move.assert_called_once_with("k", existing_id, CAMPAIGN_ID, debug=False)
+        m_bulk.assert_called_once_with("k", [existing_id], CAMPAIGN_ID, debug=False)
         m_create.assert_not_called()
         self.assertEqual(result["moved"], 1)
         self.assertEqual(result["created"], 0)
@@ -69,6 +69,47 @@ class PushFlowTests(unittest.TestCase):
         self.assertEqual(upd["id"], "raw-1")
         self.assertEqual(upd["fields"]["instantly_lead_id"], existing_id)
         self.assertEqual(upd["fields"]["instantly_campaign_id"], CAMPAIGN_ID)
+
+    def test_bulk_move_chunks_at_100(self):
+        # 250 leads with instantly_lead_id should be moved in 3 chunks
+        # of 100 + 100 + 50, not 250 individual API calls.
+        backend = _CapturingBackend()
+        leads = [{
+            "id": f"raw-{i}", "key_contact_email": f"u{i}@x.com",
+            "instantly_lead_id": _uuid(100 + i),
+        } for i in range(250)]
+
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)) as m_bulk:
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+
+        self.assertEqual(m_bulk.call_count, 3)
+        chunk_sizes = [len(call.args[1]) for call in m_bulk.call_args_list]
+        self.assertEqual(sorted(chunk_sizes), [50, 100, 100])
+        self.assertEqual(result["moved"], 250)
+        self.assertEqual(len(backend.updates), 250)
+
+    def test_bulk_move_failure_falls_back_to_per_lead(self):
+        # When the bulk endpoint fails, fall back to per-lead so granular
+        # success/failure is recorded — never lose the chunk wholesale.
+        backend = _CapturingBackend()
+        existing_id = _uuid(2)
+        leads = [{
+            "id": "raw-1",
+            "key_contact_email": "alice@example.com",
+            "instantly_lead_id": existing_id,
+        }]
+
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(False, "boom")) as m_bulk, \
+                patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)) as m_single:
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+
+        m_bulk.assert_called_once()
+        m_single.assert_called_once_with("k", existing_id, CAMPAIGN_ID, debug=False)
+        self.assertEqual(result["moved"], 1)
 
     def test_new_lead_is_created_and_written_back(self):
         backend = _CapturingBackend()
@@ -153,8 +194,8 @@ class PushFlowTests(unittest.TestCase):
 
     def test_already_in_target_campaign_is_skipped_no_api_call(self):
         # Defensive check: even if the SQL filter let one through, the
-        # push must not call /leads/move on a lead already in the target.
-        # Re-running the recategorization is then cheap and safe.
+        # push must not call any move endpoint on a lead already in the
+        # target campaign. Re-runs are then cheap and safe.
         backend = _CapturingBackend()
         existing_id = _uuid(20)
         leads = [{
@@ -163,11 +204,13 @@ class PushFlowTests(unittest.TestCase):
             "instantly_lead_id": existing_id,
             "instantly_campaign_id": CAMPAIGN_ID,  # already in target
         }]
-        with patch.object(campaign_push, "move_lead_to_campaign") as m_move, \
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign") as m_bulk, \
+                patch.object(campaign_push, "move_lead_to_campaign") as m_move, \
                 patch.object(campaign_push, "export_leads_to_instantly") as m_create:
             result = campaign_push.push_leads_to_campaign(
                 backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
             )
+        m_bulk.assert_not_called()
         m_move.assert_not_called()
         m_create.assert_not_called()
         self.assertEqual(result["already_in_place"], 1)
@@ -176,8 +219,8 @@ class PushFlowTests(unittest.TestCase):
 
     def test_lead_in_different_campaign_is_moved(self):
         # Same shape but the lead is in a *different* campaign — it must
-        # be moved into the target. The defensive skip only fires for an
-        # exact campaign-id match.
+        # be bulk-moved into the target. The defensive skip only fires
+        # for an exact campaign-id match.
         backend = _CapturingBackend()
         existing_id = _uuid(21)
         other_campaign = _uuid(99)
@@ -187,15 +230,16 @@ class PushFlowTests(unittest.TestCase):
             "instantly_lead_id": existing_id,
             "instantly_campaign_id": other_campaign,
         }]
-        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)) as m_move:
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)) as m_bulk:
             result = campaign_push.push_leads_to_campaign(
                 backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
             )
-        m_move.assert_called_once()
+        m_bulk.assert_called_once_with("k", [existing_id], CAMPAIGN_ID, debug=False)
         self.assertEqual(result["moved"], 1)
         self.assertEqual(result["already_in_place"], 0)
 
     def test_failed_move_does_not_writeback(self):
+        # Both bulk and per-lead move fail → recorded as failed, no writeback.
         backend = _CapturingBackend()
         existing_id = _uuid(5)
         leads = [{
@@ -203,7 +247,8 @@ class PushFlowTests(unittest.TestCase):
             "key_contact_email": "dave@example.com",
             "instantly_lead_id": existing_id,
         }]
-        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(False, "boom")):
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(False, "boom-bulk")), \
+                patch.object(campaign_push, "move_lead_to_campaign", return_value=(False, "boom-single")):
             result = campaign_push.push_leads_to_campaign(
                 backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
             )
@@ -220,7 +265,7 @@ class PushFlowTests(unittest.TestCase):
             {"id": "raw-B", "key_contact_email": "b@x.com", "instantly_lead_id": None},
             {"id": "raw-C", "key_contact_email": None, "instantly_lead_id": None},
         ]
-        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)), \
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)), \
                 patch.object(
                     campaign_push, "export_leads_to_instantly",
                     return_value=(1, [{"id": new_id, "email": "b@x.com"}], {}, None),
@@ -283,7 +328,7 @@ class RecategorizeAllTests(unittest.TestCase):
         backend, captured = self._make_backend(leads_by_tier)
         camp_ids = {"low": _uuid(20), "mid": _uuid(21), "high": _uuid(22)}
 
-        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)):
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)):
             result = campaign_push.recategorize_all_by_tier(
                 backend, api_key="k",
                 resolve_campaign_id=lambda t: camp_ids[t],
@@ -327,7 +372,7 @@ class RecategorizeAllTests(unittest.TestCase):
         backend, _ = self._make_backend(leads_by_tier, total_by_tier=totals)
         camp_ids = {"low": _uuid(40), "mid": _uuid(41), "high": _uuid(42)}
 
-        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)):
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)):
             result = campaign_push.recategorize_all_by_tier(
                 backend, api_key="k",
                 resolve_campaign_id=lambda t: camp_ids[t],
@@ -351,7 +396,7 @@ class RecategorizeAllTests(unittest.TestCase):
         backend, _ = self._make_backend(leads_by_tier)
         camp_ids = {"low": _uuid(23), "mid": None, "high": _uuid(24)}
 
-        with patch.object(campaign_push, "move_lead_to_campaign", return_value=(True, None)):
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)):
             result = campaign_push.recategorize_all_by_tier(
                 backend, api_key="k",
                 resolve_campaign_id=lambda t: camp_ids.get(t),
