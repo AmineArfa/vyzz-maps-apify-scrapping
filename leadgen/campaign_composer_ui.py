@@ -206,40 +206,79 @@ def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
         disabled=not confirmed,
         key="prune_run_btn",
     ):
+        log_lines: list[str] = []
+
+        def _ts() -> str:
+            from datetime import datetime, timezone
+            return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
         with st.status("Pruning leads…", expanded=True) as status:
+            def _log(msg: str) -> None:
+                line = f"[{_ts()}] {msg}"
+                log_lines.append(line)
+                try: status.write(line)
+                except Exception: pass
+
             progress_bar = st.progress(0.0, text="Starting…")
 
             def _on_progress(done, total):
                 pct = min(done / total, 1.0) if total else 1.0
                 progress_bar.progress(pct, text=f"{done}/{total} processed")
+                if total and (done == total or done % max(total // 20, 1) == 0):
+                    _log(f"   • Progress: {done}/{total} processed")
 
-            result = execute_prune(
-                backend, api_key=api_key,
-                candidates=preview["candidates"],
-                debug=debug, on_progress=_on_progress,
-            )
-            progress_bar.progress(1.0, text="Done.")
-            status.write(
-                f"✅ Done. Instantly deleted={result['deleted_instantly']} "
-                f"raw soft-deleted={result['soft_deleted_raw']} "
-                f"failed={result['failed']}"
-            )
+            result = None
+            try:
+                _log(f"Starting prune of {preview['total']} candidates.")
+                result = execute_prune(
+                    backend, api_key=api_key,
+                    candidates=preview["candidates"],
+                    debug=debug, on_progress=_on_progress,
+                )
+                progress_bar.progress(1.0, text="Done.")
+                _log(
+                    f"✅ Done. Instantly deleted={result['deleted_instantly']} "
+                    f"raw soft-deleted={result['soft_deleted_raw']} "
+                    f"failed={result['failed']}"
+                )
+            except Exception as e:
+                import traceback as _tb
+                _log(f"❌ EXCEPTION: {type(e).__name__}: {e}")
+                _log(_tb.format_exc())
 
-        cols = st.columns(3)
-        cols[0].metric("Deleted from Instantly", result["deleted_instantly"])
-        cols[1].metric("Soft-deleted in raw", result["soft_deleted_raw"])
-        cols[2].metric("Failed", result["failed"])
-
-        if result["failed"]:
-            err_rows = [
-                {"email": d.get("email"), "industry": d.get("industry"), "error": d.get("error")}
-                for d in result["details"] if d.get("error")
-            ][:50]
-            with st.expander(f"⚠️ {result['failed']} failures", expanded=False):
-                st.dataframe(pd.DataFrame(err_rows), use_container_width=True, hide_index=True)
-
+        st.session_state["prune_last_run"] = {
+            "log": log_lines,
+            "result": result,
+            "ran_at": _ts(),
+        }
         # Invalidate the preview so a re-click re-fetches.
         st.session_state.pop("prune_preview", None)
+
+    last_run = st.session_state.get("prune_last_run")
+    if last_run:
+        st.divider()
+        st.subheader("📋 Last prune run")
+        st.caption(f"Captured at {last_run['ran_at']} UTC.")
+        result = last_run.get("result")
+        if result is not None:
+            cols = st.columns(3)
+            cols[0].metric("Deleted from Instantly", result["deleted_instantly"])
+            cols[1].metric("Soft-deleted in raw", result["soft_deleted_raw"])
+            cols[2].metric("Failed", result["failed"])
+            if result["failed"]:
+                err_rows = [
+                    {"email": d.get("email"), "industry": d.get("industry"), "error": d.get("error")}
+                    for d in result["details"] if d.get("error")
+                ][:50]
+                with st.expander(f"⚠️ {result['failed']} failures", expanded=False):
+                    st.dataframe(pd.DataFrame(err_rows), use_container_width=True, hide_index=True)
+        else:
+            st.warning("Run did not finish cleanly — see log for details.")
+        with st.expander("📋 Full log (click code box top-right to copy)", expanded=True):
+            st.code("\n".join(last_run["log"]) or "(empty)", language="text")
+        if st.button("🧹 Clear log", key="prune_clear_log_btn"):
+            st.session_state.pop("prune_last_run", None)
+            st.rerun()
 
 
 def _render_reconcile_section(backend, secrets: dict, debug: bool) -> None:
@@ -292,35 +331,76 @@ def _render_reconcile_section(backend, secrets: dict, debug: bool) -> None:
             st.error("Instantly API key missing.")
             return
 
+        log_lines: list[str] = []
+
+        def _ts() -> str:
+            from datetime import datetime, timezone
+            return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
         with st.status("Reconciling unlinked leads...", expanded=True) as status:
+            def _log(msg: str) -> None:
+                line = f"[{_ts()}] {msg}"
+                log_lines.append(line)
+                try: status.write(line)
+                except Exception: pass
+
             progress_bar = st.progress(0.0, text="Starting...")
 
             def _on_progress(done, total):
                 pct = min(done / total, 1.0) if total else 1.0
                 progress_bar.progress(pct, text=f"{done}/{total} scanned")
+                # Periodic log lines so the persistent log isn't empty.
+                if total and (done == total or done % max(total // 20, 1) == 0):
+                    _log(f"   • Progress: {done}/{total} scanned")
 
-            result = reconcile_unlinked_leads(
-                backend, api_key=api_key, debug=debug, on_progress=_on_progress,
-            )
-            progress_bar.progress(1.0, text="Done.")
-            status.write(
-                f"✅ Done. Scanned={result['scanned']} Linked={result['linked']} "
-                f"NotFound={result['not_found']} Errored={result['errored']}"
-            )
+            result = None
+            try:
+                _log(f"Starting reconciliation of {unlinked} unlinked leads.")
+                result = reconcile_unlinked_leads(
+                    backend, api_key=api_key, debug=debug, on_progress=_on_progress,
+                )
+                progress_bar.progress(1.0, text="Done.")
+                _log(
+                    f"✅ Done. Scanned={result['scanned']} Linked={result['linked']} "
+                    f"NotFound={result['not_found']} Errored={result['errored']}"
+                )
+            except Exception as e:
+                import traceback as _tb
+                _log(f"❌ EXCEPTION: {type(e).__name__}: {e}")
+                _log(_tb.format_exc())
 
-        cols = st.columns(4)
-        cols[0].metric("Scanned", result["scanned"])
-        cols[1].metric("Linked", result["linked"])
-        cols[2].metric("Not in Instantly", result["not_found"])
-        cols[3].metric("Errored", result["errored"])
+        st.session_state["recon_last_run"] = {
+            "log": log_lines,
+            "result": result,
+            "ran_at": _ts(),
+        }
 
-        if result["errored"]:
-            err_rows = [
-                {"id": d["id"], "email": d["email"], "error": d["error"]}
-                for d in result["details"] if d.get("error")
-            ][:50]
-            with st.expander(f"⚠️ {result['errored']} errored", expanded=False):
-                st.dataframe(pd.DataFrame(err_rows), use_container_width=True, hide_index=True)
+    last_run = st.session_state.get("recon_last_run")
+    if last_run:
+        st.divider()
+        st.subheader("📋 Last reconcile run")
+        st.caption(f"Captured at {last_run['ran_at']} UTC.")
+        result = last_run.get("result")
+        if result is not None:
+            cols = st.columns(4)
+            cols[0].metric("Scanned", result["scanned"])
+            cols[1].metric("Linked", result["linked"])
+            cols[2].metric("Not in Instantly", result["not_found"])
+            cols[3].metric("Errored", result["errored"])
+            if result["errored"]:
+                err_rows = [
+                    {"id": d["id"], "email": d["email"], "error": d["error"]}
+                    for d in result["details"] if d.get("error")
+                ][:50]
+                with st.expander(f"⚠️ {result['errored']} errored", expanded=False):
+                    st.dataframe(pd.DataFrame(err_rows), use_container_width=True, hide_index=True)
+        else:
+            st.warning("Run did not finish cleanly — see log for details.")
+        with st.expander("📋 Full log (click code box top-right to copy)", expanded=True):
+            st.code("\n".join(last_run["log"]) or "(empty)", language="text")
+        if st.button("🧹 Clear log", key="recon_clear_log_btn"):
+            st.session_state.pop("recon_last_run", None)
+            st.rerun()
 
 
 def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
@@ -431,27 +511,38 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
             return
         operator = secrets.get("operator_email") or "operator"
 
-        with st.status("Recategorizing all leads by tier...", expanded=True) as status:
-            reset_campaign_cache()
+        # Capture every log line into session_state so the operator can
+        # review or copy them after the st.status block collapses. Any
+        # exception inside the block also gets appended for postmortem.
+        log_lines: list[str] = []
 
+        def _ts() -> str:
+            from datetime import datetime, timezone
+            return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+        with st.status("Recategorizing all leads by tier...", expanded=True) as status:
+            def _log(msg: str) -> None:
+                line = f"[{_ts()}] {msg}"
+                log_lines.append(line)
+                try: status.write(line)
+                except Exception: pass
+
+            reset_campaign_cache()
             progress_bar = st.progress(0.0, text="Starting...")
             last_phase = {"value": ""}
 
             def _resolve(tier: str) -> str | None:
                 name = tier_names[tier]
-                status.write(f"━━━ Tier '{tier}' → '{name}' ━━━")
+                _log(f"━━━ Tier '{tier}' → '{name}' ━━━")
                 return find_or_create_instantly_campaign(
-                    api_key, name, log=status.write, debug=debug,
+                    api_key, name, log=_log, debug=debug,
                 )
 
             def _on_tier_start(tier, total_to_process, already_skipped, c_id):
-                status.write(
+                _log(
                     f"📦 Tier '{tier}': {total_to_process} to process "
                     f"({already_skipped} already in place, skipped at SQL)."
                 )
-                # Persist the campaign row up front so an interrupted /
-                # cancelled / timed-out run still leaves an audit record.
-                # ON CONFLICT DO UPDATE makes this safe to call on re-runs.
                 rec_id = backend.create_campaign_record(
                     name=tier_names[tier],
                     filter_spec={"type": "ticket_tier", "value": tier},
@@ -460,77 +551,102 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
                     created_by=operator,
                 )
                 if rec_id:
-                    status.write(
-                        f"   • Recorded raw.campaigns row {rec_id[:8]}… for tier '{tier}'."
-                    )
+                    _log(f"   • Recorded raw.campaigns row {rec_id[:8]}… for tier '{tier}'.")
 
             def _on_progress(tier, done, total, phase):
                 if total <= 0:
                     return
                 pct = min(done / total, 1.0)
-                progress_bar.progress(
-                    pct,
-                    text=f"[{tier}] {phase}: {done}/{total}",
-                )
-                # Only emit a status line on phase transitions to avoid
-                # spamming the log with one entry per processed lead.
+                progress_bar.progress(pct, text=f"[{tier}] {phase}: {done}/{total}")
                 marker = f"{tier}:{phase}"
                 if marker != last_phase["value"]:
-                    status.write(f"   • {phase} phase started for tier '{tier}' ({total} leads)")
+                    _log(f"   • {phase} phase started for tier '{tier}' ({total} leads)")
                     last_phase["value"] = marker
 
-            result = recategorize_all_by_tier(
-                backend, api_key=api_key, resolve_campaign_id=_resolve, debug=debug,
-                on_tier_start=_on_tier_start, on_progress=_on_progress,
+            result = None
+            try:
+                result = recategorize_all_by_tier(
+                    backend, api_key=api_key, resolve_campaign_id=_resolve, debug=debug,
+                    on_tier_start=_on_tier_start, on_progress=_on_progress,
+                )
+                progress_bar.progress(1.0, text="Done.")
+                _log(
+                    f"✅ Done. Moved={result['moved']} Created={result['created']} "
+                    f"AlreadyInPlace={result.get('already_in_place', 0)} "
+                    f"Skipped={result['skipped']} Failed={result['failed']}"
+                )
+            except Exception as e:
+                import traceback as _tb
+                _log(f"❌ EXCEPTION: {type(e).__name__}: {e}")
+                _log(_tb.format_exc())
+
+        # Persist the run for after-the-fact review.
+        st.session_state["recat_last_run"] = {
+            "log": log_lines,
+            "result": result,
+            "tier_names": dict(tier_names),
+            "ran_at": _ts(),
+        }
+
+    # ── Persistent log + result block (survives across reruns) ───────────
+    last_run = st.session_state.get("recat_last_run")
+    if last_run:
+        st.divider()
+        st.subheader("📋 Last recategorize run")
+        st.caption(f"Captured at {last_run['ran_at']} UTC.")
+
+        result = last_run.get("result")
+        if result is not None:
+            cols = st.columns(5)
+            cols[0].metric("Moved", result["moved"])
+            cols[1].metric("Created", result["created"])
+            cols[2].metric("Already in place", result.get("already_in_place", 0))
+            cols[3].metric("Skipped", result["skipped"])
+            cols[4].metric("Failed", result["failed"])
+
+            per_tier_rows = [{
+                "tier": t,
+                "campaign": last_run["tier_names"].get(t, ""),
+                "moved": result["by_tier"][t].get("moved", 0),
+                "created": result["by_tier"][t].get("created", 0),
+                "already_in_place": result["by_tier"][t].get("already_in_place", 0),
+                "skipped": result["by_tier"][t].get("skipped", 0),
+                "failed": result["by_tier"][t].get("failed", 0),
+                "error": result["by_tier"][t].get("error") or "",
+            } for t in TIERS if t in result.get("by_tier", {})]
+            if per_tier_rows:
+                st.dataframe(pd.DataFrame(per_tier_rows), use_container_width=True, hide_index=True)
+
+            if result["failed"]:
+                failures = [
+                    d for r in result["by_tier"].values()
+                    for d in r.get("details", []) if d.get("op") == "failed"
+                ]
+                with st.expander(f"❌ {result['failed']} failed leads", expanded=False):
+                    rows = [{
+                        "tier": d.get("ticket_tier"),
+                        "email": d.get("email"),
+                        "error": d.get("error"),
+                    } for d in failures]
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.warning(
+                "Run did not finish cleanly — no result object captured. "
+                "The full log below should show what blocked it."
             )
-            progress_bar.progress(1.0, text="Done.")
-            status.write(
-                f"✅ Done. Moved={result['moved']} Created={result['created']} "
-                f"AlreadyInPlace={result.get('already_in_place', 0)} "
-                f"Skipped={result['skipped']} Failed={result['failed']}"
-            )
 
-            # Note: raw.campaigns persistence happens inside _on_tier_start
-            # (right after resolve, before leads processing) so a partially
-            # failed run still leaves an audit row. ON CONFLICT DO UPDATE
-            # keeps this idempotent across re-runs.
+        with st.expander("📋 Full log (click code box top-right to copy)", expanded=True):
+            log_text = "\n".join(last_run["log"]) or "(empty)"
+            # st.code renders a built-in copy-to-clipboard button on the
+            # top-right of the block in modern Streamlit — that's the
+            # operator's "copy" action.
+            st.code(log_text, language="text")
 
-        cols = st.columns(5)
-        cols[0].metric("Moved", result["moved"])
-        cols[1].metric("Created", result["created"])
-        cols[2].metric("Already in place", result.get("already_in_place", 0))
-        cols[3].metric("Skipped", result["skipped"])
-        cols[4].metric("Failed", result["failed"])
-
-        per_tier_rows = [{
-            "tier": t,
-            "campaign": tier_names[t],
-            "moved": result["by_tier"][t].get("moved", 0),
-            "created": result["by_tier"][t].get("created", 0),
-            "already_in_place": result["by_tier"][t].get("already_in_place", 0),
-            "skipped": result["by_tier"][t].get("skipped", 0),
-            "failed": result["by_tier"][t].get("failed", 0),
-            "error": result["by_tier"][t].get("error") or "",
-        } for t in TIERS]
-        st.dataframe(pd.DataFrame(per_tier_rows), use_container_width=True, hide_index=True)
-        st.caption(
-            "ℹ️ `already_in_place` rows were skipped at the SQL filter — leads "
-            "already in the right tier campaign aren't re-moved. Safe to re-run "
-            "this if a previous attempt was interrupted."
-        )
-
-        if result["failed"]:
-            failures = [
-                d for r in result["by_tier"].values()
-                for d in r.get("details", []) if d.get("op") == "failed"
-            ]
-            with st.expander(f"❌ {result['failed']} failures", expanded=False):
-                rows = [{
-                    "tier": d.get("ticket_tier"),
-                    "email": d.get("email"),
-                    "error": d.get("error"),
-                } for d in failures]
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        col_a, col_b = st.columns([1, 5])
+        with col_a:
+            if st.button("🧹 Clear log", key="recat_clear_log_btn"):
+                st.session_state.pop("recat_last_run", None)
+                st.rerun()
 
 
 def _render_recorded_campaigns(backend) -> None:
