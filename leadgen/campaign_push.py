@@ -90,15 +90,32 @@ def _classify_error(err: str | None) -> str:
     return "other"
 
 
-def _summarize_failures(results: list[dict]) -> list[tuple[str, int]]:
-    """Return [(bucket, count), ...] sorted desc by count."""
+def _summarize_failures(
+    results: list[dict],
+) -> list[tuple[str, int, list[str]]]:
+    """Return [(bucket, count, sample_errors), ...] sorted desc by count.
+
+    `sample_errors` is up to 2 distinct verbatim error strings per
+    bucket so the operator can see the exact wording without opening
+    the failed-leads table. Truncated to 200 chars each.
+    """
     counter: dict[str, int] = {}
+    samples: dict[str, list[str]] = {}
     for r in results:
         if r.get("op") != "failed":
             continue
         bucket = _classify_error(r.get("error"))
         counter[bucket] = counter.get(bucket, 0) + 1
-    return sorted(counter.items(), key=lambda kv: kv[1], reverse=True)
+        bucket_samples = samples.setdefault(bucket, [])
+        if len(bucket_samples) < 2:
+            err = (r.get("error") or "")[:200]
+            if err and err not in bucket_samples:
+                bucket_samples.append(err)
+    return sorted(
+        ((b, n, samples.get(b, [])) for b, n in counter.items()),
+        key=lambda t: t[1],
+        reverse=True,
+    )
 
 
 def _process_one(
@@ -452,8 +469,10 @@ def push_leads_to_campaign(
         f"failed={counts['failed']}"
     )
     if counts["failed"]:
-        for bucket, n in _summarize_failures(results):
+        for bucket, n, examples in _summarize_failures(results):
             _emit(f"   ❌ {n}× {bucket}")
+            for ex in examples:
+                _emit(f"      e.g. {ex}")
 
     return counts
 
@@ -560,12 +579,21 @@ def reconcile_unlinked_leads(
     )
     if errored:
         bucket_counts: dict[str, int] = {}
+        bucket_samples: dict[str, list[str]] = {}
         for d in details:
             b = d.get("_bucket")
-            if b:
-                bucket_counts[b] = bucket_counts.get(b, 0) + 1
+            if not b:
+                continue
+            bucket_counts[b] = bucket_counts.get(b, 0) + 1
+            samples = bucket_samples.setdefault(b, [])
+            if len(samples) < 2:
+                err = (d.get("error") or "")[:200]
+                if err and err not in samples:
+                    samples.append(err)
         for bucket, n in sorted(bucket_counts.items(), key=lambda kv: kv[1], reverse=True):
             _emit(f"   ❌ {n}× {bucket}")
+            for ex in bucket_samples.get(bucket, []):
+                _emit(f"      e.g. {ex}")
 
     return {
         "scanned": total,
