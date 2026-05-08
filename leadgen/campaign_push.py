@@ -183,6 +183,7 @@ def push_leads_to_campaign(
     debug: bool = False,
     max_workers: int = 5,
     on_progress=None,
+    log=None,
 ) -> dict:
     """Push `leads` into Instantly `campaign_id` and write back the ids.
 
@@ -218,6 +219,24 @@ def push_leads_to_campaign(
                 on_progress(done, total, phase)
             except Exception:
                 pass
+
+    def _emit(msg: str) -> None:
+        """Forward a log line to the caller's logger if provided."""
+        if log is not None:
+            try: log(msg)
+            except Exception: pass
+
+    def _log_failure(r: dict, ctx: str) -> None:
+        """Stream every individual failure to the caller's log so the
+        operator sees them immediately in the persistent run log,
+        not just in the post-run details table.
+        """
+        _emit(
+            f"❌ FAIL [{ctx}] email={r.get('email') or '—'} "
+            f"raw_id={r.get('id') or '—'} "
+            f"instantly_id={(r.get('instantly_lead_id') or '')[:8] or '—'} "
+            f"err={r.get('error') or '?'}"
+        )
 
     already, to_move, to_create, skipped = _classify(leads, campaign_id)
     _progress(0, "classify")
@@ -265,7 +284,14 @@ def push_leads_to_campaign(
             no_source.append(lead)
 
     moved_done = 0
+    if by_source:
+        _emit(
+            f"📦 Move buckets: {len(by_source)} source campaign(s) "
+            f"→ {sum(len(v) for v in by_source.values())} leads to move."
+        )
     for src_id, src_leads in by_source.items():
+        _emit(f"   • Source {src_id[:8]}…: {len(src_leads)} leads "
+              f"in {-(-len(src_leads) // _BULK_MOVE_CHUNK)} chunks of {_BULK_MOVE_CHUNK}.")
         for i in range(0, len(src_leads), _BULK_MOVE_CHUNK):
             chunk = src_leads[i : i + _BULK_MOVE_CHUNK]
             ids = [l["instantly_lead_id"] for l in chunk]
@@ -298,6 +324,10 @@ def push_leads_to_campaign(
             else:
                 # Bulk failed — fall back to per-lead so we record granular
                 # success/failure instead of failing the whole chunk.
+                _emit(
+                    f"⚠️ Bulk move chunk failed (size={len(chunk)} "
+                    f"src={src_id[:8]}…): {err}. Falling back to per-lead."
+                )
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures = [
                         ex.submit(_process_one, lead, api_key=api_key,
@@ -308,12 +338,15 @@ def push_leads_to_campaign(
                         r = fut.result()
                         results.append(r)
                         _writeback_one(r)
+                        if r["op"] == "failed":
+                            _log_failure(r, "move-fallback")
                 moved_done += len(chunk)
             _progress(len(already) + moved_done, "move")
 
     # Leads with instantly_lead_id but no current campaign — rare. The
     # per-lead path resolves the source via GET /leads/{id} before moving.
     if no_source:
+        _emit(f"📦 Per-lead move (no source campaign): {len(no_source)} leads.")
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [
                 ex.submit(_process_one, lead, api_key=api_key,
@@ -324,12 +357,15 @@ def push_leads_to_campaign(
                 r = fut.result()
                 results.append(r)
                 _writeback_one(r)
+                if r["op"] == "failed":
+                    _log_failure(r, "no-source-move")
                 moved_done += 1
                 _progress(len(already) + moved_done, "move")
 
     # ── Per-lead create with immediate writeback ─────────────────────────
     create_done = 0
     if to_create:
+        _emit(f"📦 Create bucket: {len(to_create)} new leads (per-lead, parallel x{max_workers}).")
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
                 ex.submit(
@@ -345,6 +381,8 @@ def push_leads_to_campaign(
                 # so a subsequent crash never leaves an orphaned Instantly
                 # lead that raw doesn't know about.
                 _writeback_one(r)
+                if r["op"] == "failed":
+                    _log_failure(r, "create")
                 create_done += 1
                 _progress(len(already) + len(to_move) + create_done, "create")
 
@@ -369,6 +407,7 @@ def reconcile_unlinked_leads(
     max_workers: int = 5,
     limit: int | None = None,
     on_progress=None,
+    log=None,
 ) -> dict:
     """Recover leads whose Instantly create succeeded but writeback was lost.
 
@@ -390,6 +429,11 @@ def reconcile_unlinked_leads(
     total = len(candidates)
     if not total:
         return {"scanned": 0, "linked": 0, "not_found": 0, "errored": 0, "details": []}
+
+    def _emit(msg: str) -> None:
+        if log is not None:
+            try: log(msg)
+            except Exception: pass
 
     now_iso = datetime.now(timezone.utc).isoformat()
     linked = 0
@@ -438,8 +482,17 @@ def reconcile_unlinked_leads(
                     linked += 1
                 else:
                     errored += 1
+                    _emit(
+                        f"❌ FAIL [reconcile-writeback] email={r.get('email')} "
+                        f"raw_id={r.get('id')} found_id={r['found_id']}: "
+                        f"backend.batch_update returned False"
+                    )
             elif r.get("error"):
                 errored += 1
+                _emit(
+                    f"❌ FAIL [reconcile-search] email={r.get('email')} "
+                    f"raw_id={r.get('id')}: {r['error']}"
+                )
             else:
                 not_found += 1
             if on_progress is not None:
@@ -466,6 +519,7 @@ def recategorize_all_by_tier(
     max_workers: int = 5,
     on_tier_start=None,
     on_progress=None,
+    log=None,
 ) -> dict:
     """One-click: re-route every lead in raw.scraped_leads into its tier campaign.
 
@@ -524,7 +578,7 @@ def recategorize_all_by_tier(
         push_result = push_leads_to_campaign(
             backend, api_key=api_key, leads=leads,
             campaign_id=c_id, debug=debug, max_workers=max_workers,
-            on_progress=_tier_progress,
+            on_progress=_tier_progress, log=log,
         )
         push_result["tier"] = tier
         push_result["campaign_id"] = c_id

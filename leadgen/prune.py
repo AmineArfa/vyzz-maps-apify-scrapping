@@ -86,6 +86,7 @@ def execute_prune(
     debug: bool = False,
     max_workers: int = 5,
     on_progress=None,
+    log=None,
 ) -> dict:
     """Delete each candidate from Instantly + soft-delete from raw.
 
@@ -95,6 +96,11 @@ def execute_prune(
     total = len(candidates)
     if total == 0:
         return {"deleted_instantly": 0, "soft_deleted_raw": 0, "failed": 0, "details": []}
+
+    def _emit(msg: str) -> None:
+        if log is not None:
+            try: log(msg)
+            except Exception: pass
 
     now_iso = datetime.now(timezone.utc).isoformat()
     deleted = 0
@@ -151,6 +157,20 @@ def execute_prune(
                 soft_deleted += 1
             if r["error"] and not r["deleted"]:
                 failed += 1
+                _emit(
+                    f"❌ FAIL [prune-delete] email={r.get('email')} "
+                    f"industry={r.get('industry')} "
+                    f"instantly_id={(r.get('instantly_id') or '')[:8] or '—'}: "
+                    f"{r['error']}"
+                )
+            elif r["error"]:
+                # Instantly delete OK but soft-delete raw missed (no match
+                # by id or email) — surface so the operator knows.
+                _emit(
+                    f"⚠️ WARN [prune-raw-miss] email={r.get('email')} "
+                    f"instantly_id={(r.get('instantly_id') or '')[:8] or '—'}: "
+                    f"{r['error']}"
+                )
             processed += 1
             if on_progress is not None:
                 try: on_progress(processed, total)
