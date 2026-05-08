@@ -417,7 +417,8 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
                 "phone": lead.get("generic_phone"),
                 # v2 schema does not accept arbitrary top-level fields like job_title/location.
                 # Store extras in custom_variables instead.
-                "custom_variables": custom_variables or None,
+                # Instantly schema requires this to be an object — never null.
+                "custom_variables": custom_variables or {},
             }
         )
 
@@ -446,8 +447,14 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             if debug:
                 st.write(f"❌ {err1}")
 
+            # Quota / rate-limit failures cannot be fixed by stripping custom_variables.
+            # Skip the fallback so we surface the real error and don't waste API calls.
+            if resp.status_code in (402, 403, 429):
+                return 0, [], None, err1
+
             payload_no_custom = dict(payload)
-            payload_no_custom["leads"] = [dict(l, custom_variables=None) for l in formatted_leads]
+            # Instantly schema requires custom_variables to be an object — use {} not None.
+            payload_no_custom["leads"] = [dict(l, custom_variables={}) for l in formatted_leads]
             resp2 = _post(payload_no_custom)
             if resp2.status_code == 200:
                 data = resp2.json()
