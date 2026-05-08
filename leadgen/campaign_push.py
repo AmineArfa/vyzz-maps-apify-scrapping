@@ -51,6 +51,56 @@ def _normalize_email(value: Any) -> str | None:
     return cleaned or None
 
 
+def _classify_error(err: str | None) -> str:
+    """Bucket a raw error string into a short, human-readable category.
+
+    The streaming log used to print one line per failure — at thousands
+    of failures that overwhelms the UI and is impossible to scan.
+    Instead we group by category and emit a single count per bucket.
+    """
+    if not err:
+        return "unknown"
+    e = str(err).lower()
+    if "lead limit reached" in e or "remaining uploads" in e:
+        return "instantly quota / lead limit (403)"
+    if "no resolvable source campaign" in e or "no source campaign" in e:
+        return "lead in list (no source campaign for move)"
+    if "must be object" in e or "fst_err_validation" in e:
+        return "instantly schema validation (400)"
+    if " 401 " in f" {e} " or "unauthorized" in e:
+        return "auth (401)"
+    if " 404 " in f" {e} " or "not found" in e:
+        return "not found (404)"
+    if " 429 " in f" {e} " or "rate limit" in e or "too many requests" in e:
+        return "rate limit (429)"
+    if " 402 " in f" {e} ":
+        return "payment required (402)"
+    if " 403 " in f" {e} ":
+        return "forbidden (403)"
+    if " 400 " in f" {e} ":
+        return "bad request (400)"
+    if "exception" in e or "timeout" in e or "connection" in e:
+        return "network/exception"
+    if "create returned 0" in e or "search found nothing" in e:
+        return "create returned 0 + search miss"
+    if "backend.batch_update" in e:
+        return "backend writeback failed"
+    if "no email" in e:
+        return "no email on raw row"
+    return "other"
+
+
+def _summarize_failures(results: list[dict]) -> list[tuple[str, int]]:
+    """Return [(bucket, count), ...] sorted desc by count."""
+    counter: dict[str, int] = {}
+    for r in results:
+        if r.get("op") != "failed":
+            continue
+        bucket = _classify_error(r.get("error"))
+        counter[bucket] = counter.get(bucket, 0) + 1
+    return sorted(counter.items(), key=lambda kv: kv[1], reverse=True)
+
+
 def _process_one(
     lead: dict,
     *,
@@ -227,16 +277,12 @@ def push_leads_to_campaign(
             except Exception: pass
 
     def _log_failure(r: dict, ctx: str) -> None:
-        """Stream every individual failure to the caller's log so the
-        operator sees them immediately in the persistent run log,
-        not just in the post-run details table.
+        """No-op: per-failure lines used to flood the log at thousands
+        of failures. The end-of-run summary now emits a bucketed count
+        instead. Per-failure rows still land in `results` and are shown
+        in the UI's expandable failed-leads table.
         """
-        _emit(
-            f"❌ FAIL [{ctx}] email={r.get('email') or '—'} "
-            f"raw_id={r.get('id') or '—'} "
-            f"instantly_id={(r.get('instantly_lead_id') or '')[:8] or '—'} "
-            f"err={r.get('error') or '?'}"
-        )
+        return
 
     already, to_move, to_create, skipped = _classify(leads, campaign_id)
     _progress(0, "classify")
@@ -396,6 +442,19 @@ def push_leads_to_campaign(
     for r in results:
         counts[r["op"]] = counts.get(r["op"], 0) + 1
     counts["details"] = results
+
+    # Compact end-of-run summary. Replaces the per-failure ❌ FAIL lines
+    # so the operator can copy a one-screen summary instead of scrolling
+    # through thousands of identical errors.
+    _emit(
+        f"📊 Push summary → moved={counts['moved']} created={counts['created']} "
+        f"already_in_place={counts['already_in_place']} skipped={counts['skipped']} "
+        f"failed={counts['failed']}"
+    )
+    if counts["failed"]:
+        for bucket, n in _summarize_failures(results):
+            _emit(f"   ❌ {n}× {bucket}")
+
     return counts
 
 
@@ -482,17 +541,11 @@ def reconcile_unlinked_leads(
                     linked += 1
                 else:
                     errored += 1
-                    _emit(
-                        f"❌ FAIL [reconcile-writeback] email={r.get('email')} "
-                        f"raw_id={r.get('id')} found_id={r['found_id']}: "
-                        f"backend.batch_update returned False"
-                    )
+                    # Per-failure lines drop — see _summarize at end of run.
+                    r["_bucket"] = "backend writeback failed"
             elif r.get("error"):
                 errored += 1
-                _emit(
-                    f"❌ FAIL [reconcile-search] email={r.get('email')} "
-                    f"raw_id={r.get('id')}: {r['error']}"
-                )
+                r["_bucket"] = _classify_error(r.get("error"))
             else:
                 not_found += 1
             if on_progress is not None:
@@ -500,6 +553,19 @@ def reconcile_unlinked_leads(
                     on_progress(processed, total)
                 except Exception:
                     pass
+
+    _emit(
+        f"📊 Reconcile summary → scanned={total} linked={linked} "
+        f"not_found={not_found} errored={errored}"
+    )
+    if errored:
+        bucket_counts: dict[str, int] = {}
+        for d in details:
+            b = d.get("_bucket")
+            if b:
+                bucket_counts[b] = bucket_counts.get(b, 0) + 1
+        for bucket, n in sorted(bucket_counts.items(), key=lambda kv: kv[1], reverse=True):
+            _emit(f"   ❌ {n}× {bucket}")
 
     return {
         "scanned": total,
