@@ -233,7 +233,7 @@ def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
                 result = execute_prune(
                     backend, api_key=api_key,
                     candidates=preview["candidates"],
-                    debug=debug, on_progress=_on_progress,
+                    debug=debug, on_progress=_on_progress, log=_log,
                 )
                 progress_bar.progress(1.0, text="Done.")
                 _log(
@@ -241,6 +241,15 @@ def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
                     f"raw soft-deleted={result['soft_deleted_raw']} "
                     f"failed={result['failed']}"
                 )
+                if result.get("failed"):
+                    _log(f"── Failure dump ({result['failed']} leads) ──")
+                    for d in result.get("details", []):
+                        if d.get("error") and not d.get("deleted"):
+                            _log(
+                                f"   ❌ email={d.get('email') or '—'} "
+                                f"industry={d.get('industry') or '—'} "
+                                f"err={d.get('error')}"
+                            )
             except Exception as e:
                 import traceback as _tb
                 _log(f"❌ EXCEPTION: {type(e).__name__}: {e}")
@@ -357,13 +366,23 @@ def _render_reconcile_section(backend, secrets: dict, debug: bool) -> None:
             try:
                 _log(f"Starting reconciliation of {unlinked} unlinked leads.")
                 result = reconcile_unlinked_leads(
-                    backend, api_key=api_key, debug=debug, on_progress=_on_progress,
+                    backend, api_key=api_key, debug=debug,
+                    on_progress=_on_progress, log=_log,
                 )
                 progress_bar.progress(1.0, text="Done.")
                 _log(
                     f"✅ Done. Scanned={result['scanned']} Linked={result['linked']} "
                     f"NotFound={result['not_found']} Errored={result['errored']}"
                 )
+                if result.get("errored"):
+                    _log(f"── Error dump ({result['errored']} leads) ──")
+                    for d in result.get("details", []):
+                        if d.get("error"):
+                            _log(
+                                f"   ❌ raw_id={d.get('id') or '—'} "
+                                f"email={d.get('email') or '—'} "
+                                f"err={d.get('error')}"
+                            )
             except Exception as e:
                 import traceback as _tb
                 _log(f"❌ EXCEPTION: {type(e).__name__}: {e}")
@@ -568,6 +587,7 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
                 result = recategorize_all_by_tier(
                     backend, api_key=api_key, resolve_campaign_id=_resolve, debug=debug,
                     on_tier_start=_on_tier_start, on_progress=_on_progress,
+                    log=_log,
                 )
                 progress_bar.progress(1.0, text="Done.")
                 _log(
@@ -575,6 +595,18 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
                     f"AlreadyInPlace={result.get('already_in_place', 0)} "
                     f"Skipped={result['skipped']} Failed={result['failed']}"
                 )
+                # Belt-and-suspenders: dump every failure detail into the log
+                # so the persistent block is self-contained for postmortem.
+                if result.get("failed"):
+                    _log(f"── Failure dump ({result['failed']} leads) ──")
+                    for tier, by in result.get("by_tier", {}).items():
+                        for d in by.get("details", []):
+                            if d.get("op") == "failed":
+                                _log(
+                                    f"   ❌ tier={tier} email={d.get('email') or '—'} "
+                                    f"raw_id={d.get('id') or '—'} "
+                                    f"err={d.get('error') or '?'}"
+                                )
             except Exception as e:
                 import traceback as _tb
                 _log(f"❌ EXCEPTION: {type(e).__name__}: {e}")

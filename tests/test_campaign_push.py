@@ -597,6 +597,87 @@ class RecategorizeAllTests(unittest.TestCase):
         self.assertEqual(result["by_tier"]["high"]["moved"], 1)
 
 
+class LogCallbackTests(unittest.TestCase):
+    """The `log` callback emits a line per failure / phase transition."""
+
+    def test_log_receives_per_lead_failure_in_create_path(self):
+        backend = _CapturingBackend()
+        leads = [{
+            "id": "raw-fail",
+            "key_contact_email": "fail@example.com",
+            "instantly_lead_id": None,
+        }]
+        captured: list[str] = []
+
+        with patch.object(
+                    campaign_push, "export_leads_to_instantly",
+                    return_value=(0, [], {}, "Instantly exploded"),
+                ), \
+                patch.object(campaign_push, "search_lead_by_email", return_value=(None, None)):
+            campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID,
+                max_workers=1, log=captured.append,
+            )
+
+        # The create attempt failed → log must contain a per-lead FAIL entry
+        # tagged with the email. Belt-and-suspenders: also a "Create bucket"
+        # phase line.
+        joined = "\n".join(captured)
+        self.assertIn("fail@example.com", joined)
+        self.assertIn("FAIL", joined)
+        self.assertIn("create", joined)
+
+    def test_log_receives_bulk_chunk_failure_message(self):
+        backend = _CapturingBackend()
+        existing_id = _uuid(70)
+        source = _uuid(71)
+        leads = [{
+            "id": "raw-1",
+            "key_contact_email": "x@y.com",
+            "instantly_lead_id": existing_id,
+            "instantly_campaign_id": source,
+        }]
+        captured: list[str] = []
+
+        with patch.object(
+                    campaign_push, "bulk_move_leads_to_campaign",
+                    return_value=(False, "rate limited 429"),
+                ), \
+                patch.object(campaign_push, "move_lead_to_campaign", return_value=(False, "still rate limited")):
+            campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID,
+                max_workers=1, log=captured.append,
+            )
+
+        joined = "\n".join(captured)
+        # Bulk chunk failure surfaced.
+        self.assertIn("Bulk move chunk failed", joined)
+        self.assertIn("rate limited 429", joined)
+        # Per-lead fallback failure surfaced too.
+        self.assertIn("FAIL", joined)
+        self.assertIn("x@y.com", joined)
+
+    def test_log_silent_on_clean_run(self):
+        # On a clean success path, no FAIL lines should be emitted —
+        # only phase / source bucket markers.
+        backend = _CapturingBackend()
+        existing_id = _uuid(80)
+        source = _uuid(81)
+        leads = [{
+            "id": "raw-clean", "key_contact_email": "clean@y.com",
+            "instantly_lead_id": existing_id, "instantly_campaign_id": source,
+        }]
+        captured: list[str] = []
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)):
+            campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID,
+                max_workers=1, log=captured.append,
+            )
+        joined = "\n".join(captured)
+        self.assertNotIn("FAIL", joined)
+        self.assertNotIn("Bulk move chunk failed", joined)
+
+
 class MoveLeadHelperTests(unittest.TestCase):
     """The move_lead_to_campaign / bulk_move_leads_to_campaign helpers."""
 
