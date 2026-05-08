@@ -28,7 +28,7 @@ from typing import Any
 # imports (commas, parens, spaces) without rejecting valid edge cases.
 # Instantly's Fastify schema returns 400 "No valid leads found" on these,
 # so filtering client-side avoids burning a quota slot on a guaranteed fail.
-_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+'\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 
 def _is_valid_email_format(email: str | None) -> bool:
@@ -240,6 +240,103 @@ def _base_for(lead: dict) -> dict:
     }
 
 
+def _dedupe_in_batch(
+    leads: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Collapse multiple raw rows sharing the same email into one survivor.
+
+    The 2026-05-08 IT review found 6,026 raw rows in `raw.scraped_leads`
+    that shared an `instantly_lead_id` because the scraper produced ≥2
+    rows per email and each row independently called the Instantly create
+    path; Instantly's server-side dedupe returns the same lead_id for
+    both, so multiple raw rows wrote the same id back. Killing that at
+    the source means dropping duplicate emails *before* any API call.
+
+    Tie-breaks (most-preferred wins):
+      1. row that already has `instantly_lead_id` set (it's linked)
+      2. row whose `verification_status` looks valid
+      3. first occurrence in the input list (deterministic)
+
+    Returns (survivors, dropped). Dropped leads carry a temporary
+    `_dedup_drop_reason` key the caller turns into a skip result.
+    """
+    by_email: dict[str, dict] = {}
+    dropped: list[dict] = []
+
+    def _quality(lead: dict) -> tuple[int, int]:
+        # Higher tuple wins.
+        has_id = 1 if lead.get("instantly_lead_id") else 0
+        vs = (lead.get("verification_status") or "").strip().lower()
+        verified = 1 if vs in {"valid", "ok", "deliverable"} else 0
+        return (has_id, verified)
+
+    for lead in leads:
+        email = _normalize_email(lead.get("key_contact_email"))
+        if not email:
+            # Rows without an email are out of scope here — let `_classify`
+            # bucket them as `skipped: no email` further down.
+            by_email.setdefault(f"__no_email__{lead.get('id')}", lead)
+            continue
+        existing = by_email.get(email)
+        if existing is None:
+            by_email[email] = lead
+        else:
+            if _quality(lead) > _quality(existing):
+                # New lead is higher quality; existing becomes a duplicate drop.
+                drop = {**existing, "_dedup_drop_reason": "duplicate-email-in-batch"}
+                dropped.append(drop)
+                by_email[email] = lead
+            else:
+                drop = {**lead, "_dedup_drop_reason": "duplicate-email-in-batch"}
+                dropped.append(drop)
+    return list(by_email.values()), dropped
+
+
+def _reroute_existing_pushed(
+    backend,
+    leads: list[dict],
+    campaign_id: str,
+) -> None:
+    """Mutate `leads` in place: for any row without `instantly_lead_id` whose
+    email is already pushed to a *different* campaign, copy the existing
+    lead_id + source campaign onto the row so `_classify` routes it through
+    `to_move` instead of `to_create`. Without this, the create path would
+    spawn a duplicate Instantly lead the next time the row is processed.
+
+    Backends that can't answer the question return {} and we fall through
+    silently — equivalent to today's behavior, no regression.
+    """
+    if not leads:
+        return
+    candidates = [
+        l for l in leads
+        if not l.get("instantly_lead_id") and _normalize_email(l.get("key_contact_email"))
+    ]
+    if not candidates:
+        return
+    emails = [_normalize_email(l.get("key_contact_email")) for l in candidates]
+    finder = getattr(backend, "find_pushed_siblings_by_email", None)
+    if finder is None:
+        return
+    try:
+        siblings = finder(emails=emails, exclude_campaign_id=campaign_id) or {}
+    except Exception:
+        siblings = {}
+    if not siblings:
+        return
+    for lead in candidates:
+        email = _normalize_email(lead.get("key_contact_email"))
+        match = siblings.get(email) if email else None
+        if not match:
+            continue
+        sib_id = match.get("instantly_lead_id")
+        sib_campaign = match.get("instantly_campaign_id")
+        if sib_id and is_valid_uuid(sib_id):
+            lead["instantly_lead_id"] = sib_id
+            if sib_campaign:
+                lead["instantly_campaign_id"] = sib_campaign
+
+
 def _classify(leads: list[dict], campaign_id: str) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Split leads into buckets: already_in_place, to_move, to_create, skipped.
 
@@ -327,7 +424,20 @@ def push_leads_to_campaign(
         """
         return
 
-    already, to_move, to_create, skipped = _classify(leads, campaign_id)
+    # Pre-flight: kill same-email duplicates before they reach the API. Then
+    # for surviving rows, reroute any whose email is already pushed in a
+    # different campaign through the MOVE path (otherwise the CREATE path
+    # would silently spawn a duplicate Instantly lead).
+    survivors, dedup_dropped = _dedupe_in_batch(leads)
+    _reroute_existing_pushed(backend, survivors, campaign_id)
+    if dedup_dropped:
+        _emit(
+            f"📦 Pre-flight dedupe: {len(dedup_dropped)} duplicate email row(s) "
+            f"collapsed to 1 survivor each."
+        )
+
+    already, to_move, to_create, skipped = _classify(survivors, campaign_id)
+    skipped.extend(dedup_dropped)
     _progress(0, "classify")
 
     # ── Already in place ─────────────────────────────────────────────────
@@ -337,6 +447,30 @@ def push_leads_to_campaign(
             "op": "already_in_place",
             "error": None,
         })
+
+    def _clear_siblings(instantly_lead_id: str | None, keep_row_id: str | None) -> None:
+        """Sibling cleanup. The same Instantly lead_id can only live in one
+        campaign at a time, so any *other* raw row that previously held
+        this lead_id is now stale (Instantly moved the lead, our DB still
+        pointed at the old campaign). Null those out so the next sync run
+        re-evaluates them cleanly.
+
+        Backends that don't implement this helper are silently skipped —
+        the in-batch dedupe + re-route still prevent net-new duplicates,
+        sibling cleanup is the belt-and-braces layer.
+        """
+        if not instantly_lead_id or not keep_row_id:
+            return
+        clear = getattr(backend, "clear_link_on_sibling_rows", None)
+        if clear is None:
+            return
+        try:
+            clear(instantly_lead_id=instantly_lead_id, keep_row_id=keep_row_id)
+        except Exception:
+            # Sibling cleanup is best-effort — never break the push run if
+            # the cleanup query throws. The next reconcile sweep will catch
+            # whatever is left.
+            pass
 
     def _writeback_one(r: dict) -> None:
         """Flush a single lead writeback immediately to raw.scraped_leads.
@@ -354,10 +488,11 @@ def push_leads_to_campaign(
                 "fields": {
                     "instantly_lead_id": r["instantly_lead_id"],
                     "instantly_campaign_id": campaign_id,
-                    "instantly_statuts": "Success",
-                    "last_synced_at": now_iso,
+                    "instantly_status": "Success",
+                    "instantly_synced_at": now_iso,
                 },
             }])
+            _clear_siblings(r.get("instantly_lead_id"), r.get("id"))
 
     # ── Bulk move: group by SOURCE campaign first, then chunk ────────────
     # Instantly's /leads/move treats `ids` as a filter inside `campaign`
@@ -403,12 +538,16 @@ def push_leads_to_campaign(
                         "fields": {
                             "instantly_lead_id": lead["instantly_lead_id"],
                             "instantly_campaign_id": campaign_id,
-                            "instantly_statuts": "Success",
-                            "last_synced_at": now_iso,
+                            "instantly_status": "Success",
+                            "instantly_synced_at": now_iso,
                         },
                     })
                 if chunk_writeback:
                     backend.batch_update(chunk_writeback)
+                    for lead in chunk:
+                        _clear_siblings(
+                            lead.get("instantly_lead_id"), lead.get("id"),
+                        )
                 moved_done += len(chunk)
             else:
                 # Bulk failed — fall back to per-lead so we record granular
@@ -475,10 +614,14 @@ def push_leads_to_campaign(
                 create_done += 1
                 _progress(len(already) + len(to_move) + create_done, "create")
 
-    # ── Skipped leads (missing or malformed email) ───────────────────────
+    # ── Skipped leads (missing email, invalid format, or pre-flight dedup) ─
     for lead in skipped:
-        email = _normalize_email(lead.get("key_contact_email"))
-        reason = "no email" if not email else "invalid email format"
+        dedup_reason = lead.get("_dedup_drop_reason")
+        if dedup_reason:
+            reason = dedup_reason
+        else:
+            email = _normalize_email(lead.get("key_contact_email"))
+            reason = "no email" if not email else "invalid email format"
         results.append({
             **_base_for(lead), "op": "skipped", "error": reason,
         })
@@ -579,12 +722,22 @@ def reconcile_unlinked_leads(
                 # in raw if we already know about it.
                 fields = {
                     "instantly_lead_id": r["found_id"],
-                    "last_synced_at": now_iso,
+                    "instantly_synced_at": now_iso,
                 }
                 if r.get("found_campaign"):
                     fields["instantly_campaign_id"] = r["found_campaign"]
                 ok = backend.batch_update([{"id": r["id"], "fields": fields}])
                 if ok:
+                    # Sibling cleanup: same lead_id may have lived on stale rows.
+                    clear = getattr(backend, "clear_link_on_sibling_rows", None)
+                    if clear is not None:
+                        try:
+                            clear(
+                                instantly_lead_id=r["found_id"],
+                                keep_row_id=r["id"],
+                            )
+                        except Exception:
+                            pass
                     linked += 1
                 else:
                     errored += 1

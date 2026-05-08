@@ -145,9 +145,15 @@ class UpdateTierGuardTests(unittest.TestCase):
             },
         }])
         self.assertTrue(ok)
-        self.assertEqual(len(conn.cursor_obj.executed), 1)
-        sql, params = conn.cursor_obj.executed[0]
-        self.assertIn("UPDATE raw.scraped_leads SET", sql)
+        # P2 (2026-05-08) wraps each UPDATE in a SAVEPOINT/RELEASE pair so
+        # a unique-violation on one row doesn't kill the whole batch — find
+        # the UPDATE among the savepoint chatter.
+        updates = [
+            (sql, params) for sql, params in conn.cursor_obj.executed
+            if "UPDATE raw.scraped_leads SET" in sql
+        ]
+        self.assertEqual(len(updates), 1)
+        sql, params = updates[0]
         self.assertNotIn("ticket_tier", sql)
         self.assertNotIn("low", params)
         # Industry and status do go through.
@@ -161,8 +167,12 @@ class UpdateTierGuardTests(unittest.TestCase):
             "id": "00000000-0000-0000-0000-000000000001",
             "fields": {"industry": "Med Spa"},
         }])
-        sql, _ = conn.cursor_obj.executed[0]
-        self.assertNotIn("ticket_tier", sql)
+        updates = [
+            sql for sql, _ in conn.cursor_obj.executed
+            if "UPDATE raw.scraped_leads SET" in sql
+        ]
+        self.assertEqual(len(updates), 1)
+        self.assertNotIn("ticket_tier", updates[0])
 
 
 if __name__ == "__main__":
