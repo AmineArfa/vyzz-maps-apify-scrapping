@@ -304,7 +304,7 @@ def execute_with_credit_tracking(
                        # Update local records with status
                        for r in processed_batch:
                             if r.get("key_contact_email"):
-                                 set_if_allowed(r, "instantly_statuts", "Pending")
+                                 set_if_allowed(r, "instantly_status", "Pending")
                                  set_if_allowed(r, "instantly_campaign_id", campaign_id)
                        
                        if exp_err:
@@ -316,7 +316,7 @@ def execute_with_credit_tracking(
                                  try:
                                       c_idx = int(created.get("index"))
                                       if 0 <= c_idx < len(valid_leads_instantly):
-                                           set_if_allowed(valid_leads_instantly[c_idx], "instantly_statuts", "Success")
+                                           set_if_allowed(valid_leads_instantly[c_idx], "instantly_status", "Success")
                                            set_if_allowed(valid_leads_instantly[c_idx], "instantly_lead_id", created.get("id"))
                                  except: pass
 
