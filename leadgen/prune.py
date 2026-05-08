@@ -169,19 +169,26 @@ def execute_prune(
     )
     if failed or any(d.get("error") and d.get("deleted") for d in details):
         delete_buckets: dict[str, int] = {}
+        delete_samples: dict[str, list[str]] = {}
         raw_miss = 0
         for d in details:
             err = d.get("error")
             if not err:
                 continue
             if not d.get("deleted"):
-                delete_buckets[_classify_error(err)] = (
-                    delete_buckets.get(_classify_error(err), 0) + 1
-                )
+                bucket = _classify_error(err)
+                delete_buckets[bucket] = delete_buckets.get(bucket, 0) + 1
+                samples = delete_samples.setdefault(bucket, [])
+                if len(samples) < 2:
+                    snippet = str(err)[:200]
+                    if snippet not in samples:
+                        samples.append(snippet)
             else:
                 raw_miss += 1
         for bucket, n in sorted(delete_buckets.items(), key=lambda kv: kv[1], reverse=True):
             _emit(f"   ❌ {n}× {bucket}")
+            for ex in delete_samples.get(bucket, []):
+                _emit(f"      e.g. {ex}")
         if raw_miss:
             _emit(f"   ⚠️ {raw_miss}× soft-delete miss in raw (Instantly deleted OK)")
 
