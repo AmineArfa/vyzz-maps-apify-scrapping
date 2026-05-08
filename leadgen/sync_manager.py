@@ -91,7 +91,7 @@ def _build_patch_payload(
         "company_name": clean_data.get("company_name"),
         "website": clean_data.get("website"),
         "phone": clean_data.get("generic_phone"),
-        "custom_variables": merged_vars or None,
+        "custom_variables": merged_vars or {},
     })
 
 
