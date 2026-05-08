@@ -696,29 +696,54 @@ def list_contacted_unreplied_leads(api_key, *, limit_per_page=100, log=None, on_
     return out
 
 
-def bulk_move_leads_to_campaign(api_key, lead_ids, campaign_id, debug=False):
+def bulk_move_leads_to_campaign(
+    api_key, lead_ids, to_campaign_id, *, from_campaign_id, debug=False,
+):
     """Move many leads at once via Instantly's bulk move endpoint.
 
-    `POST /api/v2/leads/move` accepts a list of ids and reassigns them
-    all to `to_campaign_id` server-side. Custom variables (`lid`, industry,
-    ticket_tier, etc.) are preserved — the call only changes campaign
-    membership. Returns (success: bool, error: str | None).
+    POST /api/v2/leads/move requires BOTH:
+      - `ids`: lead ids to act on (acts as a FILTER, not a standalone selector)
+      - `campaign`: the source campaign the ids must currently sit in
+      - `to_campaign_id`: the destination
 
-    Caller is responsible for chunking. Empirically Instantly accepts at
-    least 100 ids per call comfortably; larger payloads risk 413/timeout.
+    Per the OpenAPI spec: "When using `ids`, you must provide either
+    `campaign` or `list_id` to specify which campaign or list to filter
+    the leads from. This parameter acts as a filter within the specified
+    campaign or list, not as a standalone way to select leads."
+
+    The earlier impl omitted `campaign`, so Instantly filtered against
+    "no source" → empty set → silent zero moves on every call.
+
+    Custom variables (lid, industry, ticket_tier, etc.) are preserved —
+    the call only changes campaign membership server-side. Returns
+    (success: bool, error: str | None).
     """
-    if not api_key or not lead_ids or not campaign_id:
-        return False, "Missing api_key, lead_ids, or campaign_id"
-    if not is_valid_uuid(campaign_id):
-        return False, f"Invalid campaign_id format: {campaign_id}"
+    if not api_key or not lead_ids or not to_campaign_id or not from_campaign_id:
+        return False, "Missing api_key, lead_ids, from_campaign_id, or to_campaign_id"
+    if not is_valid_uuid(to_campaign_id):
+        return False, f"Invalid to_campaign_id format: {to_campaign_id}"
+    if not is_valid_uuid(from_campaign_id):
+        return False, f"Invalid from_campaign_id format: {from_campaign_id}"
 
-    valid_ids = [lid for lid in lead_ids if isinstance(lid, str) and is_valid_uuid(lid)]
+    # Dedup ids — the same Instantly lead can be referenced by many
+    # raw.scraped_leads rows (duplicate-email imports). Sending dups
+    # may cause partial-success ambiguity.
+    seen: set[str] = set()
+    valid_ids: list[str] = []
+    for lid in lead_ids:
+        if isinstance(lid, str) and is_valid_uuid(lid) and lid not in seen:
+            seen.add(lid)
+            valid_ids.append(lid)
     if not valid_ids:
         return False, "No valid lead UUIDs in batch"
 
     url = f"{BASE_URL}/api/v2/leads/move"
     headers = _headers(api_key)
-    payload = {"ids": valid_ids, "to_campaign_id": campaign_id}
+    payload = {
+        "ids": valid_ids,
+        "campaign": from_campaign_id,       # SOURCE filter (required when ids is set)
+        "to_campaign_id": to_campaign_id,   # DESTINATION
+    }
 
     try:
         resp = _request_with_retry(
@@ -726,7 +751,10 @@ def bulk_move_leads_to_campaign(api_key, lead_ids, campaign_id, debug=False):
         )
         if 200 <= resp.status_code < 300:
             if debug:
-                st.write(f"➡️ Bulk-moved {len(valid_ids)} leads → {campaign_id[:8]}…")
+                st.write(
+                    f"➡️ Bulk-moved {len(valid_ids)} leads "
+                    f"{from_campaign_id[:8]}… → {to_campaign_id[:8]}…"
+                )
             return True, None
         err = f"Bulk move failed: {resp.status_code} - {resp.text[:200]}"
         if debug:
@@ -739,44 +767,34 @@ def bulk_move_leads_to_campaign(api_key, lead_ids, campaign_id, debug=False):
         return False, err
 
 
-def move_lead_to_campaign(api_key, lead_id, campaign_id, debug=False):
-    """Move an existing Instantly lead into `campaign_id`. Idempotent.
+def move_lead_to_campaign(api_key, lead_id, to_campaign_id, *, from_campaign_id=None, debug=False):
+    """Move a single Instantly lead from `from_campaign_id` to `to_campaign_id`.
 
-    Use this for leads that already have an `instantly_lead_id`: PATCHing
-    `campaign_id` reassigns the existing lead row, which preserves the id
-    on both sides and avoids creating a duplicate. Per-lead campaign
-    membership is the model — Instantly leads belong to one campaign.
-
-    Implemented via the bulk move endpoint (POST /api/v2/leads/move) so
-    the same call works whether the lead was already in `campaign_id`
-    (no-op) or in another one (reassignment).
+    The move endpoint REQUIRES the source campaign even for a single id.
+    If `from_campaign_id` is None we look it up first via GET /leads/{id};
+    callers that already have it (the per-lead fallback inside
+    push_leads_to_campaign) should pass it explicitly to avoid the extra
+    round trip.
     """
-    if not api_key or not lead_id or not campaign_id:
-        return False, "Missing api_key, lead_id, or campaign_id"
+    if not api_key or not lead_id or not to_campaign_id:
+        return False, "Missing api_key, lead_id, or to_campaign_id"
     if not is_valid_uuid(lead_id):
         return False, f"Invalid Lead ID format: {lead_id}"
-    if not is_valid_uuid(campaign_id):
-        return False, f"Invalid campaign_id format: {campaign_id}"
+    if not is_valid_uuid(to_campaign_id):
+        return False, f"Invalid to_campaign_id format: {to_campaign_id}"
 
-    url = f"{BASE_URL}/api/v2/leads/move"
-    headers = _headers(api_key)
-    payload = {"ids": [lead_id], "to_campaign_id": campaign_id}
+    if from_campaign_id is None:
+        existing, get_err = get_lead_from_instantly(api_key, lead_id, debug=debug)
+        if not existing:
+            return False, f"Cannot resolve source campaign: {get_err}"
+        from_campaign_id = existing.get("campaign")
+    if not from_campaign_id or not is_valid_uuid(from_campaign_id):
+        return False, "Lead has no resolvable source campaign id"
 
-    try:
-        resp = _request_with_retry("POST", url, headers=headers, json_payload=payload, timeout=20)
-        if 200 <= resp.status_code < 300:
-            if debug:
-                st.write(f"➡️ Moved lead {lead_id[:8]}… into campaign {campaign_id[:8]}…")
-            return True, None
-        err = f"Instantly move failed: {resp.status_code} - {resp.text}"
-        if debug:
-            st.write(f"⚠️ {err}")
-        return False, err
-    except Exception as e:
-        err = f"Instantly move exception: {e}"
-        if debug:
-            st.write(f"⚠️ {err}")
-        return False, err
+    return bulk_move_leads_to_campaign(
+        api_key, [lead_id], to_campaign_id,
+        from_campaign_id=from_campaign_id, debug=debug,
+    )
 
 
 def delete_lead_from_instantly(api_key, lead_id, debug=False):

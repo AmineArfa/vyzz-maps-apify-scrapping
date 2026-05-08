@@ -121,7 +121,12 @@ def _process_one(
     found, _ = search_lead_by_email(api_key, email, debug=debug)
     if found and found.get("id") and is_valid_uuid(found["id"]):
         found_id = found["id"]
-        ok, move_err = move_lead_to_campaign(api_key, found_id, campaign_id, debug=debug)
+        # The search response carries the lead's current campaign — pass it
+        # so move_lead_to_campaign doesn't need a second GET to resolve.
+        ok, move_err = move_lead_to_campaign(
+            api_key, found_id, campaign_id,
+            from_campaign_id=found.get("campaign"), debug=debug,
+        )
         if ok:
             return {**base, "op": "moved", "instantly_lead_id": found_id, "error": None}
         return {**base, "op": "failed", "error": f"create=0, move-after-search failed: {move_err}"}
@@ -246,49 +251,81 @@ def push_leads_to_campaign(
                 },
             }])
 
-    # ── Bulk move existing leads in chunks ───────────────────────────────
-    moved_done = 0
-    for i in range(0, len(to_move), _BULK_MOVE_CHUNK):
-        chunk = to_move[i : i + _BULK_MOVE_CHUNK]
-        ids = [l["instantly_lead_id"] for l in chunk]
-        if i > 0 and _BULK_MOVE_THROTTLE_SEC > 0:
-            time.sleep(_BULK_MOVE_THROTTLE_SEC)
-        ok, err = bulk_move_leads_to_campaign(api_key, ids, campaign_id, debug=debug)
-        if ok:
-            # Per-chunk writeback BEFORE moving to the next chunk so a
-            # mid-loop crash leaves earlier chunks durably persisted.
-            chunk_writeback = []
-            for lead in chunk:
-                results.append({
-                    **_base_for(lead), "op": "moved", "error": None,
-                })
-                chunk_writeback.append({
-                    "id": lead["id"],
-                    "fields": {
-                        "instantly_lead_id": lead["instantly_lead_id"],
-                        "instantly_campaign_id": campaign_id,
-                        "instantly_statuts": "Success",
-                        "last_synced_at": now_iso,
-                    },
-                })
-            if chunk_writeback:
-                backend.batch_update(chunk_writeback)
-            moved_done += len(chunk)
+    # ── Bulk move: group by SOURCE campaign first, then chunk ────────────
+    # Instantly's /leads/move treats `ids` as a filter inside `campaign`
+    # (the source). Leads from different source campaigns can't be moved
+    # in a single call — group first, then chunk within each group.
+    by_source: dict[str, list[dict]] = {}
+    no_source: list[dict] = []
+    for lead in to_move:
+        src = lead.get("instantly_campaign_id")
+        if src and is_valid_uuid(src):
+            by_source.setdefault(src, []).append(lead)
         else:
-            # Bulk failed — fall back to per-lead so we record granular
-            # success/failure instead of failing the whole chunk.
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = [
-                    ex.submit(_process_one, lead, api_key=api_key,
-                              campaign_id=campaign_id, debug=debug)
-                    for lead in chunk
-                ]
-                for fut in as_completed(futures):
-                    r = fut.result()
-                    results.append(r)
-                    _writeback_one(r)
-            moved_done += len(chunk)
-        _progress(len(already) + moved_done, "move")
+            no_source.append(lead)
+
+    moved_done = 0
+    for src_id, src_leads in by_source.items():
+        for i in range(0, len(src_leads), _BULK_MOVE_CHUNK):
+            chunk = src_leads[i : i + _BULK_MOVE_CHUNK]
+            ids = [l["instantly_lead_id"] for l in chunk]
+            if (i > 0 or moved_done > 0) and _BULK_MOVE_THROTTLE_SEC > 0:
+                time.sleep(_BULK_MOVE_THROTTLE_SEC)
+            ok, err = bulk_move_leads_to_campaign(
+                api_key, ids, campaign_id,
+                from_campaign_id=src_id, debug=debug,
+            )
+            if ok:
+                # Per-chunk writeback BEFORE moving to the next chunk so a
+                # mid-loop crash leaves earlier chunks durably persisted.
+                chunk_writeback = []
+                for lead in chunk:
+                    results.append({
+                        **_base_for(lead), "op": "moved", "error": None,
+                    })
+                    chunk_writeback.append({
+                        "id": lead["id"],
+                        "fields": {
+                            "instantly_lead_id": lead["instantly_lead_id"],
+                            "instantly_campaign_id": campaign_id,
+                            "instantly_statuts": "Success",
+                            "last_synced_at": now_iso,
+                        },
+                    })
+                if chunk_writeback:
+                    backend.batch_update(chunk_writeback)
+                moved_done += len(chunk)
+            else:
+                # Bulk failed — fall back to per-lead so we record granular
+                # success/failure instead of failing the whole chunk.
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = [
+                        ex.submit(_process_one, lead, api_key=api_key,
+                                  campaign_id=campaign_id, debug=debug)
+                        for lead in chunk
+                    ]
+                    for fut in as_completed(futures):
+                        r = fut.result()
+                        results.append(r)
+                        _writeback_one(r)
+                moved_done += len(chunk)
+            _progress(len(already) + moved_done, "move")
+
+    # Leads with instantly_lead_id but no current campaign — rare. The
+    # per-lead path resolves the source via GET /leads/{id} before moving.
+    if no_source:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [
+                ex.submit(_process_one, lead, api_key=api_key,
+                          campaign_id=campaign_id, debug=debug)
+                for lead in no_source
+            ]
+            for fut in as_completed(futures):
+                r = fut.result()
+                results.append(r)
+                _writeback_one(r)
+                moved_done += 1
+                _progress(len(already) + moved_done, "move")
 
     # ── Per-lead create with immediate writeback ─────────────────────────
     create_done = 0
