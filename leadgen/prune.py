@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
+from .campaign_push import _classify_error
 from .instantly import (
     delete_lead_from_instantly,
     list_contacted_unreplied_leads,
@@ -157,24 +158,32 @@ def execute_prune(
                 soft_deleted += 1
             if r["error"] and not r["deleted"]:
                 failed += 1
-                _emit(
-                    f"❌ FAIL [prune-delete] email={r.get('email')} "
-                    f"industry={r.get('industry')} "
-                    f"instantly_id={(r.get('instantly_id') or '')[:8] or '—'}: "
-                    f"{r['error']}"
-                )
-            elif r["error"]:
-                # Instantly delete OK but soft-delete raw missed (no match
-                # by id or email) — surface so the operator knows.
-                _emit(
-                    f"⚠️ WARN [prune-raw-miss] email={r.get('email')} "
-                    f"instantly_id={(r.get('instantly_id') or '')[:8] or '—'}: "
-                    f"{r['error']}"
-                )
             processed += 1
             if on_progress is not None:
                 try: on_progress(processed, total)
                 except Exception: pass
+
+    _emit(
+        f"📊 Prune summary → deleted_instantly={deleted} "
+        f"soft_deleted_raw={soft_deleted} failed={failed}"
+    )
+    if failed or any(d.get("error") and d.get("deleted") for d in details):
+        delete_buckets: dict[str, int] = {}
+        raw_miss = 0
+        for d in details:
+            err = d.get("error")
+            if not err:
+                continue
+            if not d.get("deleted"):
+                delete_buckets[_classify_error(err)] = (
+                    delete_buckets.get(_classify_error(err), 0) + 1
+                )
+            else:
+                raw_miss += 1
+        for bucket, n in sorted(delete_buckets.items(), key=lambda kv: kv[1], reverse=True):
+            _emit(f"   ❌ {n}× {bucket}")
+        if raw_miss:
+            _emit(f"   ⚠️ {raw_miss}× soft-delete miss in raw (Instantly deleted OK)")
 
     return {
         "deleted_instantly": deleted,
