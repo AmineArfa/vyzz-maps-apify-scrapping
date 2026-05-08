@@ -19,9 +19,22 @@ operate at; if it ever isn't, parallelize via a ThreadPoolExecutor.
 """
 from __future__ import annotations
 
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
+
+# RFC-5322-lite. Catches the malformed local-parts we observe from CSV
+# imports (commas, parens, spaces) without rejecting valid edge cases.
+# Instantly's Fastify schema returns 400 "No valid leads found" on these,
+# so filtering client-side avoids burning a quota slot on a guaranteed fail.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _is_valid_email_format(email: str | None) -> bool:
+    if not email:
+        return False
+    return bool(_EMAIL_RE.match(email))
 
 from .instantly import (
     bulk_move_leads_to_campaign,
@@ -170,6 +183,11 @@ def _process_one(
     # ── Create path ──────────────────────────────────────────────────────
     if not email:
         return {**base, "op": "skipped", "error": "no email"}
+    if not _is_valid_email_format(email):
+        # Instantly returns a generic "No valid leads found" 400 on these.
+        # Skip them up front so quota isn't wasted and the operator can
+        # spot them in the failed-leads table by reason.
+        return {**base, "op": "skipped", "error": "invalid email format"}
 
     cnt, created, _, err = export_leads_to_instantly(
         api_key, campaign_id, [lead], debug=debug,
@@ -188,6 +206,14 @@ def _process_one(
     found, _ = search_lead_by_email(api_key, email, debug=debug)
     if found and found.get("id") and is_valid_uuid(found["id"]):
         found_id = found["id"]
+        # If the lead is already in the target campaign, calling /leads/move
+        # would 400 with "Source and destination campaigns cannot be the same".
+        # Treat as already_in_place and let the writeback path link the row.
+        if found.get("campaign") == campaign_id:
+            return {
+                **base, "op": "already_in_place",
+                "instantly_lead_id": found_id, "error": None,
+            }
         # The search response carries the lead's current campaign — pass it
         # so move_lead_to_campaign doesn't need a second GET to resolve.
         ok, move_err = move_lead_to_campaign(
@@ -234,7 +260,7 @@ def _classify(leads: list[dict], campaign_id: str) -> tuple[list[dict], list[dic
             already.append(lead)
         elif instantly_lead_id and is_valid_uuid(instantly_lead_id):
             to_move.append(lead)
-        elif email:
+        elif email and _is_valid_email_format(email):
             to_create.append(lead)
         else:
             skipped.append(lead)
@@ -322,7 +348,7 @@ def push_leads_to_campaign(
         exists server-side (consuming plan capacity) but raw never knows,
         and re-runs can't deduplicate it.
         """
-        if r["op"] in ("moved", "created") and r.get("id") and r.get("instantly_lead_id"):
+        if r["op"] in ("moved", "created", "already_in_place") and r.get("id") and r.get("instantly_lead_id"):
             backend.batch_update([{
                 "id": r["id"],
                 "fields": {
@@ -449,10 +475,12 @@ def push_leads_to_campaign(
                 create_done += 1
                 _progress(len(already) + len(to_move) + create_done, "create")
 
-    # ── No-email skips ───────────────────────────────────────────────────
+    # ── Skipped leads (missing or malformed email) ───────────────────────
     for lead in skipped:
+        email = _normalize_email(lead.get("key_contact_email"))
+        reason = "no email" if not email else "invalid email format"
         results.append({
-            **_base_for(lead), "op": "skipped", "error": "no email",
+            **_base_for(lead), "op": "skipped", "error": reason,
         })
 
     counts = {"moved": 0, "created": 0, "skipped": 0, "failed": 0, "already_in_place": 0}
