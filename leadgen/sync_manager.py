@@ -369,18 +369,18 @@ def sync_pending_leads(
     failure_counts: Counter[str] = Counter()
     failure_samples: dict[str, list[str]] = defaultdict(list)
     for res in results:
-        # IMPORTANT: Only update last_synced_at on SUCCESS so failures stay "Pending"
+        # IMPORTANT: Only update instantly_synced_at on SUCCESS so failures stay "Pending"
         if res.get("status") == "Success":
             success_count += 1
-            fields = {"last_synced_at": timestamp_now}
+            fields = {"instantly_synced_at": timestamp_now}
 
             op = res.get("op")
             if op in ("Create", "Update", "Link"):
-                fields["instantly_statuts"] = "Success"
+                fields["instantly_status"] = "Success"
             elif op == "Delete":
-                fields["instantly_statuts"] = None  # Clear status on delete
+                fields["instantly_status"] = None  # Clear status on delete
             else:  # Skip
-                fields["instantly_statuts"] = None
+                fields["instantly_status"] = None
 
             # Persist the (new) Instantly IDs
             fields["instantly_lead_id"] = res.get("new_instantly_id")
@@ -388,12 +388,12 @@ def sync_pending_leads(
 
             airtable_updates.append({"id": res["id"], "fields": fields})
         else:
-            # On Failure: We mark as Failed in Airtable but do NOT update last_synced_at
+            # On Failure: We mark as Failed in Airtable but do NOT update instantly_synced_at
             # This keeps it in the "Pending" list for user to fix/retry.
             airtable_updates.append(
                 {
                     "id": res["id"],
-                    "fields": {"instantly_statuts": "Failed"},
+                    "fields": {"instantly_status": "Failed"},
                 }
             )
             err = res.get("error")
@@ -598,10 +598,10 @@ def cleanup_bad_leads(
 
         fields: dict = {
             "verification_status": res["verification_status"],
-            # ALWAYS update last_synced_at so the lead leaves the pending
+            # ALWAYS update instantly_synced_at so the lead leaves the pending
             # backlog regardless of whether the Instantly delete succeeded.
-            "last_synced_at": timestamp_now,
-            "instantly_statuts": "Blocked",
+            "instantly_synced_at": timestamp_now,
+            "instantly_status": "Blocked",
         }
 
         if res.get("error"):

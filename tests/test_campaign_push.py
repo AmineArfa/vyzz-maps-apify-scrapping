@@ -725,5 +725,231 @@ class MoveLeadHelperTests(unittest.TestCase):
         self.assertEqual(len(captured["payload"]["ids"]), 2)  # deduped
 
 
+class PreflightDedupeTests(unittest.TestCase):
+    """Pre-flight dedupe (P0a, 2026-05-08): collapse same-email duplicates
+    BEFORE any Instantly API call, and reroute would-be CREATEs through
+    MOVE when the email is already pushed in a different campaign.
+    """
+
+    def test_in_batch_duplicates_collapse_to_one_create(self):
+        # 3 raw rows with the same email + 1 row with a unique email.
+        # Expect: 1 row in to_create per email = 2 creates total, 2 dups
+        # become skipped with reason 'duplicate-email-in-batch'.
+        backend = _CapturingBackend()
+        new_id_a = _uuid(80)
+        new_id_b = _uuid(81)
+        leads = [
+            {"id": "raw-a1", "key_contact_email": "alice@x.com", "instantly_lead_id": None},
+            {"id": "raw-a2", "key_contact_email": "alice@x.com", "instantly_lead_id": None},
+            {"id": "raw-a3", "key_contact_email": "ALICE@X.COM", "instantly_lead_id": None},
+            {"id": "raw-b1", "key_contact_email": "bob@x.com", "instantly_lead_id": None},
+        ]
+        # Two unique emails after dedupe → two creates.
+        export_calls = {"n": 0}
+        def fake_create(api_key, campaign_id, lead_list, *, debug=False):
+            export_calls["n"] += 1
+            email = lead_list[0]["key_contact_email"].lower()
+            new_id = new_id_a if email == "alice@x.com" else new_id_b
+            return (1, [{"id": new_id, "email": email}], {}, None)
+
+        with patch.object(campaign_push, "export_leads_to_instantly", side_effect=fake_create), \
+                patch.object(campaign_push, "inject_lid_to_lead", return_value=(True, None)):
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+
+        # Exactly one Instantly create per unique email.
+        self.assertEqual(export_calls["n"], 2)
+        self.assertEqual(result["created"], 2)
+        self.assertEqual(result["skipped"], 2)
+        self.assertEqual(result["failed"], 0)
+        # The 2 skipped rows carry the dedup reason.
+        skip_reasons = [d["error"] for d in result["details"] if d["op"] == "skipped"]
+        self.assertEqual(skip_reasons.count("duplicate-email-in-batch"), 2)
+
+    def test_in_batch_dedup_prefers_already_linked_row(self):
+        # When duplicates exist and one already has instantly_lead_id, that
+        # row wins — re-creating would otherwise spawn a duplicate.
+        backend = _CapturingBackend()
+        existing_id = _uuid(82)
+        source = _uuid(906)
+        leads = [
+            {"id": "raw-fresh", "key_contact_email": "carol@x.com",
+             "instantly_lead_id": None},
+            {"id": "raw-linked", "key_contact_email": "carol@x.com",
+             "instantly_lead_id": existing_id, "instantly_campaign_id": source},
+        ]
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)) as m_bulk, \
+                patch.object(campaign_push, "export_leads_to_instantly") as m_create:
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+        m_bulk.assert_called_once()  # the linked row gets moved
+        m_create.assert_not_called()  # the fresh duplicate never reaches Instantly
+        self.assertEqual(result["moved"], 1)
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["skipped"], 1)
+
+    def test_email_already_pushed_in_other_campaign_is_rerouted_to_move(self):
+        # Lead arrives with NULL instantly_lead_id (would normally CREATE),
+        # but the same email is already pushed in a different campaign.
+        # Pre-flight reroutes it through MOVE, no duplicate ever spawns.
+        existing_id = _uuid(83)
+        other_campaign = _uuid(907)
+
+        class _DBBackend:
+            def __init__(self):
+                self.updates = []
+            def batch_update(self, updates):
+                self.updates.extend(updates)
+                return True
+            def find_pushed_siblings_by_email(self, *, emails, exclude_campaign_id):
+                # The DB knows about a sibling in `other_campaign`.
+                return {
+                    "dell'orto@x.com": {
+                        "instantly_lead_id": existing_id,
+                        "instantly_campaign_id": other_campaign,
+                    },
+                }
+
+        backend = _DBBackend()
+        leads = [{
+            "id": "raw-rer",
+            "key_contact_email": "Dell'Orto@x.com",
+            "instantly_lead_id": None,
+        }]
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign", return_value=(True, None)) as m_bulk, \
+                patch.object(campaign_push, "export_leads_to_instantly") as m_create:
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+        # MOVE was called with the sibling's id and source campaign.
+        m_bulk.assert_called_once_with(
+            "k", [existing_id], CAMPAIGN_ID,
+            from_campaign_id=other_campaign, debug=False,
+        )
+        m_create.assert_not_called()
+        self.assertEqual(result["moved"], 1)
+        self.assertEqual(result["created"], 0)
+
+    def test_no_siblings_means_normal_create_path(self):
+        # Backend reports no siblings → normal CREATE path runs.
+        new_id = _uuid(84)
+
+        class _EmptyDBBackend:
+            def __init__(self):
+                self.updates = []
+            def batch_update(self, updates):
+                self.updates.extend(updates)
+                return True
+            def find_pushed_siblings_by_email(self, *, emails, exclude_campaign_id):
+                return {}
+
+        backend = _EmptyDBBackend()
+        leads = [{"id": "raw-x", "key_contact_email": "newone@x.com",
+                  "instantly_lead_id": None}]
+        with patch.object(campaign_push, "export_leads_to_instantly",
+                          return_value=(1, [{"id": new_id, "email": "newone@x.com"}], {}, None)), \
+                patch.object(campaign_push, "inject_lid_to_lead", return_value=(True, None)):
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+        self.assertEqual(result["created"], 1)
+
+
+class EmailRegexTests(unittest.TestCase):
+    """Email validity regex (P1, 2026-05-08): RFC-5321 allows apostrophes
+    in the local part. Rejecting them leaves valid leads (o'grady,
+    dell'orto) stuck in `skipped: invalid email format`.
+    """
+
+    def test_apostrophe_in_local_part_is_valid(self):
+        self.assertTrue(campaign_push._is_valid_email_format("o'grady@example.com"))
+        self.assertTrue(campaign_push._is_valid_email_format("dell'orto@hotel.com"))
+
+    def test_obvious_invalid_email_still_rejected(self):
+        self.assertFalse(campaign_push._is_valid_email_format("not.an.email"))
+        self.assertFalse(campaign_push._is_valid_email_format(""))
+        self.assertFalse(campaign_push._is_valid_email_format(None))
+
+    def test_existing_valid_emails_still_pass(self):
+        # Sanity: the apostrophe addition didn't break the rest of the regex.
+        self.assertTrue(campaign_push._is_valid_email_format("alice@example.com"))
+        self.assertTrue(campaign_push._is_valid_email_format("a.b+tag-1_2%3@x.co"))
+
+
+class SiblingCleanupTests(unittest.TestCase):
+    """Sibling cleanup (P0b, 2026-05-08): when writeback persists a lead_id
+    onto one row, NULL the same lead_id on every other raw row that held
+    it. The Instantly lead can only live in one campaign at a time; any
+    other raw row claiming it is now stale.
+    """
+
+    class _CleanupBackend:
+        def __init__(self):
+            self.updates: list[dict] = []
+            self.cleared: list[tuple[str, str]] = []
+
+        def batch_update(self, updates):
+            self.updates.extend(updates)
+            return True
+
+        def clear_link_on_sibling_rows(self, *, instantly_lead_id, keep_row_id):
+            self.cleared.append((instantly_lead_id, keep_row_id))
+            return 1  # pretend one sibling was cleared
+
+    def test_writeback_clears_siblings_on_create(self):
+        backend = self._CleanupBackend()
+        new_id = _uuid(90)
+        leads = [{
+            "id": "raw-create",
+            "key_contact_email": "create@x.com",
+            "instantly_lead_id": None,
+        }]
+        with patch.object(campaign_push, "export_leads_to_instantly",
+                          return_value=(1, [{"id": new_id, "email": "create@x.com"}], {}, None)), \
+                patch.object(campaign_push, "inject_lid_to_lead", return_value=(True, None)):
+            campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+        self.assertEqual(backend.cleared, [(new_id, "raw-create")])
+
+    def test_writeback_clears_siblings_on_bulk_move(self):
+        backend = self._CleanupBackend()
+        existing_id = _uuid(91)
+        source = _uuid(908)
+        leads = [{
+            "id": "raw-mv",
+            "key_contact_email": "mv@x.com",
+            "instantly_lead_id": existing_id,
+            "instantly_campaign_id": source,
+        }]
+        with patch.object(campaign_push, "bulk_move_leads_to_campaign",
+                          return_value=(True, None)):
+            campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+        self.assertEqual(backend.cleared, [(existing_id, "raw-mv")])
+
+    def test_writeback_skips_cleanup_when_backend_lacks_method(self):
+        # Backwards-compat: legacy backends without clear_link_on_sibling_rows
+        # must not break the push.
+        backend = _CapturingBackend()
+        new_id = _uuid(92)
+        leads = [{
+            "id": "raw-legacy",
+            "key_contact_email": "legacy@x.com",
+            "instantly_lead_id": None,
+        }]
+        with patch.object(campaign_push, "export_leads_to_instantly",
+                          return_value=(1, [{"id": new_id, "email": "legacy@x.com"}], {}, None)), \
+                patch.object(campaign_push, "inject_lid_to_lead", return_value=(True, None)):
+            result = campaign_push.push_leads_to_campaign(
+                backend, api_key="k", leads=leads, campaign_id=CAMPAIGN_ID, max_workers=1,
+            )
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(len(backend.updates), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

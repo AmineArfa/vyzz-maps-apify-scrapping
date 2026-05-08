@@ -76,6 +76,28 @@ class DataBackend(Protocol):
         """Filter a record to only include writable fields."""
         ...
 
+    def find_pushed_siblings_by_email(
+        self, *, emails: list[str], exclude_campaign_id: str | None,
+    ) -> dict:
+        """Return {lower(email) -> {instantly_lead_id, instantly_campaign_id}}
+        for rows already pushed to Instantly in a campaign other than
+        `exclude_campaign_id`. Used by the push pre-flight to reroute
+        would-be CREATEs into MOVEs.
+
+        Backends that can't query efficiently may return {} — the in-batch
+        dedupe still runs and the worst case degrades to today's behavior.
+        """
+        ...
+
+    def clear_link_on_sibling_rows(
+        self, *, instantly_lead_id: str, keep_row_id: str,
+    ) -> int:
+        """NULL the instantly_* fields on every row sharing
+        `instantly_lead_id` except `keep_row_id`. Returns rows cleared.
+        Used by `_writeback_one` to keep one row per Instantly lead.
+        """
+        ...
+
 
 class AirtableBackend:
     """Wraps existing airtable_utils functions behind the DataBackend interface."""
@@ -167,3 +189,16 @@ class AirtableBackend:
     def filter_fields(self, record: dict) -> dict:
         allowed = self.get_writable_field_names(self.leads_table_id)
         return filter_airtable_fields(record, allowed)
+
+    def find_pushed_siblings_by_email(
+        self, *, emails: list[str], exclude_campaign_id: str | None,
+    ) -> dict:
+        # Airtable backend is being retired (see dev/CLAUDE.md). Cross-row
+        # de-dup is only meaningful in the Supabase path; fall back to the
+        # safe no-op so the Airtable path keeps today's behavior.
+        return {}
+
+    def clear_link_on_sibling_rows(
+        self, *, instantly_lead_id: str, keep_row_id: str,
+    ) -> int:
+        return 0

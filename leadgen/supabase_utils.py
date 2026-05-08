@@ -30,8 +30,6 @@ APP_TO_SB: dict[str, str] = {
     "key_contact_name": "contact_name",
     "key_contact_email": "contact_email",
     "key_contact_position": "contact_position",
-    "instantly_statuts": "instantly_status",
-    "last_synced_at": "instantly_synced_at",
 }
 
 SB_TO_APP: dict[str, str] = {v: k for k, v in APP_TO_SB.items()}
@@ -191,7 +189,7 @@ def fetch_all_leads_sb(conn: psycopg2.extensions.connection) -> list[dict]:
                 if "updated_at" in mapped:
                     mapped["last_modified_at"] = mapped.pop("updated_at")
                 # Convert datetime objects to ISO strings for pandas compatibility
-                for key in ("last_modified_at", "last_synced_at"):
+                for key in ("last_modified_at", "instantly_synced_at"):
                     val = mapped.get(key)
                     if val and hasattr(val, "isoformat"):
                         mapped[key] = val.isoformat()
@@ -297,9 +295,9 @@ def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[di
     Maps field names.
 
     updated_at handling:
-      - If the update includes instantly_synced_at (last_synced_at), we set
-        updated_at := instantly_synced_at so the "pending" filter
-        (updated_at > instantly_synced_at) does not immediately re-trigger.
+      - If the update includes instantly_synced_at, we set updated_at to
+        the same value so the "pending" filter (updated_at > instantly_synced_at)
+        does not immediately re-trigger.
       - Otherwise, updated_at := NOW().
 
     Previously this always did updated_at=NOW(), which caused sync writes to
@@ -311,6 +309,12 @@ def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[di
     if not updates:
         return True
 
+    # Per-row savepoints so a single failure (e.g. unique-violation from
+    # uniq_scraped_leads_email_when_pushed) doesn't roll back the whole
+    # batch. Without this, one bad row cancelled all writebacks and we'd
+    # lose dozens of just-pushed Instantly leads' state, recreating them
+    # on the next sync run. See P2 in 2026-05-08 Instantly sync fixes.
+    skipped_unique = 0
     try:
         with conn.cursor() as cur:
             for update in updates:
@@ -350,12 +354,28 @@ def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[di
                     set_parts.append("updated_at = NOW()")
                 params.append(row_id)
 
-                cur.execute(
-                    f"UPDATE raw.scraped_leads SET {', '.join(set_parts)} WHERE id = %s::uuid",
-                    params,
-                )
+                cur.execute("SAVEPOINT row_update")
+                try:
+                    cur.execute(
+                        f"UPDATE raw.scraped_leads SET {', '.join(set_parts)} WHERE id = %s::uuid",
+                        params,
+                    )
+                    cur.execute("RELEASE SAVEPOINT row_update")
+                except psycopg2.errors.UniqueViolation:
+                    # The duplicate-email partial index fired. Means another
+                    # row in raw is already linked to this email; the push
+                    # path's pre-flight dedupe should have prevented this,
+                    # but the index is the belt-and-braces. Skip this row
+                    # and keep going so the rest of the batch persists.
+                    cur.execute("ROLLBACK TO SAVEPOINT row_update")
+                    skipped_unique += 1
 
         conn.commit()
+        if skipped_unique:
+            st.warning(
+                f"batch_update: {skipped_unique} row(s) skipped due to "
+                f"duplicate-email-db-constraint (uniq_scraped_leads_email_when_pushed)."
+            )
         return True
     except Exception as e:
         conn.rollback()
@@ -403,6 +423,98 @@ def fetch_unlinked_leads_with_email_sb(
         st.error(f"Error fetching unlinked leads: {e}")
         conn.rollback()
         return []
+
+
+def find_pushed_siblings_by_email_sb(
+    conn: psycopg2.extensions.connection,
+    *,
+    emails: list[str],
+    exclude_campaign_id: str | None,
+) -> dict:
+    """For each email, find a raw row that's already pushed to Instantly in
+    a *different* campaign than `exclude_campaign_id`. Used by the push
+    pre-flight to reroute would-be CREATEs into MOVEs, preventing the
+    duplicate-lead_id drift seen in the 2026-05-08 IT review.
+
+    Returns: {lower(email) -> {"instantly_lead_id": str,
+                                "instantly_campaign_id": str}}.
+    """
+    if not emails:
+        return {}
+    lowered = sorted({e.strip().lower() for e in emails if e})
+    if not lowered:
+        return {}
+    sql = """
+        SELECT LOWER(contact_email) AS email,
+               instantly_lead_id,
+               instantly_campaign_id
+          FROM raw.scraped_leads
+         WHERE LOWER(contact_email) = ANY(%s)
+           AND instantly_lead_id IS NOT NULL
+           AND instantly_status = 'Success'
+           AND excluded_at IS NULL
+    """
+    params: list = [lowered]
+    if exclude_campaign_id:
+        sql += " AND (instantly_campaign_id IS DISTINCT FROM %s)"
+        params.append(exclude_campaign_id)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            out: dict = {}
+            for r in cur.fetchall():
+                email = r["email"]
+                if email and email not in out:
+                    out[email] = {
+                        "instantly_lead_id": r["instantly_lead_id"],
+                        "instantly_campaign_id": r["instantly_campaign_id"],
+                    }
+            return out
+    except Exception as e:
+        st.error(f"find_pushed_siblings_by_email failed: {e}")
+        conn.rollback()
+        return {}
+
+
+def clear_link_on_sibling_rows_sb(
+    conn: psycopg2.extensions.connection,
+    *,
+    instantly_lead_id: str,
+    keep_row_id: str,
+) -> int:
+    """NULL out instantly_* fields on every row sharing `instantly_lead_id`
+    except `keep_row_id`. Called from `_writeback_one` so a successful push
+    leaves no stale siblings claiming the same Instantly lead.
+
+    The same Instantly lead can only live in one campaign at a time, so any
+    other raw row holding that id is now wrong (Instantly moved the lead,
+    our DB still pointed at the old campaign). NULLing the satellite
+    columns lets the next sync run re-evaluate them cleanly.
+
+    Returns the number of sibling rows cleared.
+    """
+    if not instantly_lead_id or not keep_row_id:
+        return 0
+    sql = """
+        UPDATE raw.scraped_leads
+           SET instantly_lead_id      = NULL,
+               instantly_campaign_id  = NULL,
+               instantly_status       = NULL,
+               instantly_synced_at    = NULL,
+               updated_at             = NOW()
+         WHERE instantly_lead_id = %s
+           AND id <> %s::uuid
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (instantly_lead_id, keep_row_id))
+            cleared = cur.rowcount
+        conn.commit()
+        return int(cleared or 0)
+    except Exception as e:
+        conn.rollback()
+        st.error(f"clear_link_on_sibling_rows failed: {e}")
+        return 0
 
 
 def soft_delete_by_instantly_id_or_email_sb(
@@ -669,6 +781,27 @@ class SupabaseBackend:
 
     def count_unlinked_leads_with_email(self) -> int:
         return count_unlinked_leads_with_email_sb(self.conn)
+
+    def find_pushed_siblings_by_email(
+        self,
+        *,
+        emails: list[str],
+        exclude_campaign_id: str | None,
+    ) -> dict:
+        return find_pushed_siblings_by_email_sb(
+            self.conn,
+            emails=emails,
+            exclude_campaign_id=exclude_campaign_id,
+        )
+
+    def clear_link_on_sibling_rows(
+        self, *, instantly_lead_id: str, keep_row_id: str,
+    ) -> int:
+        return clear_link_on_sibling_rows_sb(
+            self.conn,
+            instantly_lead_id=instantly_lead_id,
+            keep_row_id=keep_row_id,
+        )
 
     def soft_delete_by_instantly_id_or_email(
         self, *, instantly_lead_id: str | None, email: str | None, fields: dict,

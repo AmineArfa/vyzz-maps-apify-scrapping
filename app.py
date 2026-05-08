@@ -424,12 +424,12 @@ def main():
         # Ensure timestamp columns exist
         if "last_modified_at" not in df.columns:
             df["last_modified_at"] = None
-        if "last_synced_at" not in df.columns:
-            df["last_synced_at"] = None
+        if "instantly_synced_at" not in df.columns:
+            df["instantly_synced_at"] = None
             
         # Convert to datetime for comparison
         df["last_modified_at"] = pd.to_datetime(df["last_modified_at"], errors='coerce', utc=True)
-        df["last_synced_at"] = pd.to_datetime(df["last_synced_at"], errors='coerce', utc=True)
+        df["instantly_synced_at"] = pd.to_datetime(df["instantly_synced_at"], errors='coerce', utc=True)
 
         # --- FILTER PENDING UPDATES ---
         # Logic: last_modified > last_synced OR last_synced is NaT (Never synced)
@@ -439,7 +439,7 @@ def main():
         
         def is_pending(row):
             mod = row["last_modified_at"]
-            syn = row["last_synced_at"]
+            syn = row["instantly_synced_at"]
 
             # Historical backfill guard: rows explicitly marked as having a
             # stale Instantly ID (Phase D Step 3.8 C2a-stale cohort) must NOT
@@ -447,7 +447,7 @@ def main():
             # purpose, and auto-pushing them re-burns MillionVerifier credits
             # and risks creating duplicates if the original lead still exists
             # elsewhere in Instantly. Operator must re-verify cohort manually.
-            status = row.get("instantly_statuts")
+            status = row.get("instantly_status")
             if status == "stale_reference_cleared":
                 return False
 
@@ -455,7 +455,7 @@ def main():
             if pd.isna(syn): return True # Never synced
 
             # Recovery: leads wrongly blocked as catch_all/unknown need re-syncing.
-            # They have last_synced_at set but were never actually added to Instantly.
+            # They have instantly_synced_at set but were never actually added to Instantly.
             v_status = row.get("verification_status", "")
             if status == "Blocked" and str(v_status).strip().lower() in ("catch_all", "unknown", ""):
                 return True
@@ -541,7 +541,7 @@ def main():
                 use_container_width=True,
                 column_config={
                     "last_modified_at": st.column_config.DatetimeColumn("Modified", format="D MMM HH:mm"),
-                    "last_synced_at": st.column_config.DatetimeColumn("Last Synced", format="D MMM HH:mm"),
+                    "instantly_synced_at": st.column_config.DatetimeColumn("Last Synced", format="D MMM HH:mm"),
                     "id": None,
                     "createdTime": None
                 },
@@ -551,7 +551,7 @@ def main():
                     "key_contact_email",
                     "verification_status",
                     "last_modified_at", 
-                    "last_synced_at",
+                    "instantly_synced_at",
                     "key_contact_name", 
                     "key_contact_position",
                 ] 
