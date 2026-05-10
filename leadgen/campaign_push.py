@@ -155,6 +155,7 @@ def _process_one(
         "email": email,
         "company_name": lead.get("company_name"),
         "industry": lead.get("industry"),
+        "industry2": lead.get("industry2"),
         "ticket_tier": lead.get("ticket_tier"),
         "instantly_lead_id": instantly_lead_id,
     }
@@ -235,6 +236,7 @@ def _base_for(lead: dict) -> dict:
         "email": _normalize_email(lead.get("key_contact_email")),
         "company_name": lead.get("company_name"),
         "industry": lead.get("industry"),
+        "industry2": lead.get("industry2"),
         "ticket_tier": lead.get("ticket_tier"),
         "instantly_lead_id": lead.get("instantly_lead_id"),
     }
