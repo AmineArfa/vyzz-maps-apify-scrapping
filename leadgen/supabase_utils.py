@@ -19,6 +19,7 @@ import psycopg2.extras
 import streamlit as st
 
 from .campaign_filter import build_where as build_filter_where
+from .industry2 import compute_industry2
 from .json_sanitize import sanitize_for_json
 from .ticket_tier import compute_ticket_tier
 
@@ -39,7 +40,8 @@ SKIP_ON_INSERT = {"id", "createdTime", "last_modified_at", "created_at", "update
 
 # All valid columns in raw.scraped_leads (for filtering writes)
 VALID_SB_COLUMNS = {
-    "source_tool", "import_batch_id", "company_name", "industry", "ticket_tier",
+    "source_tool", "import_batch_id", "company_name", "industry", "industry2",
+    "ticket_tier",
     "website",
     "city", "state", "postal_code", "postal_address", "phone", "rating",
     "contact_name", "contact_email", "contact_position",
@@ -52,7 +54,8 @@ VALID_SB_COLUMNS = {
 
 # Columns for INSERT (subset of VALID_SB_COLUMNS, fixed order for execute_values)
 INSERT_COLUMNS = [
-    "source_tool", "import_batch_id", "company_name", "industry", "ticket_tier",
+    "source_tool", "import_batch_id", "company_name", "industry", "industry2",
+    "ticket_tier",
     "website",
     "city", "state", "postal_code", "postal_address", "phone", "rating",
     "contact_name", "contact_email", "contact_position",
@@ -63,7 +66,12 @@ INSERT_COLUMNS = [
 # it on UPDATE — once a row has a tier, it is treated as operator-set (a
 # luxury restaurant could be "high" even though Restaurants and Bars defaults
 # to "low"). Update paths must NOT silently re-derive tier from industry.
-COMPUTED_ON_INSERT_ONLY = {"ticket_tier"}
+#
+# industry2 is also computed on INSERT only — it's a deterministic relabel of
+# industry for email copy. If the operator wants a different label they can
+# UPDATE the row directly; the canonical map should not silently overwrite
+# their choice on every update.
+COMPUTED_ON_INSERT_ONLY = {"ticket_tier", "industry2"}
 
 # Columns for dedup reads (minimal). Excluded (soft-deleted) rows still
 # count for dedup so we don't re-import a lead the operator has already
@@ -73,7 +81,8 @@ DEDUP_QUERY = "SELECT website, phone FROM raw.scraped_leads WHERE website IS NOT
 # Columns for sync manager reads (21 of 26 — excludes source_tool, import_batch_id,
 # email_verified, verified_at, rating, created_at)
 SYNC_QUERY = """
-SELECT id, company_name, industry, ticket_tier, website, city, state,
+SELECT id, company_name, industry, industry2, ticket_tier,
+       website, city, state,
        postal_code, postal_address, phone,
        contact_name, contact_email, contact_position,
        instantly_lead_id, instantly_campaign_id, instantly_status,
@@ -147,6 +156,8 @@ def _row_to_insert_tuple(record: dict, source_tool: str, batch_id: str) -> tuple
     mapped["import_batch_id"] = batch_id
     if not mapped.get("ticket_tier"):
         mapped["ticket_tier"] = compute_ticket_tier(mapped.get("industry"))
+    if not mapped.get("industry2"):
+        mapped["industry2"] = compute_industry2(mapped.get("industry"))
     return tuple(mapped.get(col) for col in INSERT_COLUMNS)
 
 
@@ -387,7 +398,8 @@ def batch_update_leads_sb(conn: psycopg2.extensions.connection, updates: list[di
 
 # Columns returned for the sample preview / push-eligibility list.
 _SAMPLE_COLUMNS = (
-    "id", "company_name", "industry", "ticket_tier", "city", "state",
+    "id", "company_name", "industry", "industry2", "ticket_tier",
+    "city", "state",
     "contact_email", "contact_name", "website", "phone",
     "instantly_lead_id", "instantly_campaign_id", "verification_status",
 )
@@ -403,7 +415,7 @@ def fetch_unlinked_leads_with_email_sb(
     from earlier runs whose writeback was lost.
     """
     sql = """
-        SELECT id, contact_email, company_name, ticket_tier, industry
+        SELECT id, contact_email, company_name, ticket_tier, industry, industry2
           FROM raw.scraped_leads
          WHERE instantly_lead_id IS NULL
            AND contact_email IS NOT NULL

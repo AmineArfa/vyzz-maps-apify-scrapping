@@ -362,7 +362,7 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             campaign_id,
             variables=["postalCode", "jobTitle", "address", "City", "state",
                        "competitor1", "competitor2", "competitor3", "lid",
-                       "industry", "ticket_tier"],
+                       "industry", "industry2", "ticket_tier"],
             debug=debug,
         )
 
@@ -382,6 +382,9 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
         industry_val = lead.get("industry")
         if isinstance(industry_val, list):
             industry_val = industry_val[0] if industry_val else None
+        industry2_val = lead.get("industry2")
+        if isinstance(industry2_val, list):
+            industry2_val = industry2_val[0] if industry2_val else None
         ticket_tier_val = lead.get("ticket_tier")
         if isinstance(ticket_tier_val, list):
             ticket_tier_val = ticket_tier_val[0] if ticket_tier_val else None
@@ -395,6 +398,7 @@ def export_leads_to_instantly(api_key, campaign_id, leads, debug=False):
             "competitor2": lead.get("competitor2"),
             "competitor3": lead.get("competitor3"),
             "industry": industry_val,
+            "industry2": industry2_val,
             "ticket_tier": ticket_tier_val,
         }
         
@@ -721,9 +725,9 @@ def bulk_move_leads_to_campaign(
     The earlier impl omitted `campaign`, so Instantly filtered against
     "no source" → empty set → silent zero moves on every call.
 
-    Custom variables (lid, industry, ticket_tier, etc.) are preserved —
-    the call only changes campaign membership server-side. Returns
-    (success: bool, error: str | None).
+    Custom variables (lid, industry, industry2, ticket_tier, etc.) are
+    preserved — the call only changes campaign membership server-side.
+    Returns (success: bool, error: str | None).
     """
     if not api_key or not lead_ids or not to_campaign_id or not from_campaign_id:
         return False, "Missing api_key, lead_ids, from_campaign_id, or to_campaign_id"
