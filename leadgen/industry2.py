@@ -69,6 +69,12 @@ INDUSTRY2_BY_INDUSTRY: dict[str, str] = {
     "Government Services":          "Administrative services company",
     "Accounting and Tax Services":  "Accounting services",
     "Telecommunications":           "Telecom company",
+    # Industries seen on Instantly leads that were uploaded outside the
+    # scraper (CSV imports, manual additions). Not present in raw.scraped_leads
+    # at the time of the 2026-05-10 audit, but added here so future imports
+    # using these labels still get a clean industry2.
+    "Healthcare, Pharmaceuticals, & Biotech": "Healthcare company",
+    "Software & Internet":                    "Software",
 }
 
 

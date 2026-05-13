@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot backfill: write `industry2` into every existing Instantly lead's
+"""One-shot backfill: write `industry2` into every Instantly lead's
 custom_variables, preserving every other key Instantly already has.
 
 Why this exists
@@ -7,49 +7,38 @@ Why this exists
 We added the `industry2` field on 2026-05-10. Going forward, the scraper
 writes it on INSERT and the campaign-push pipeline includes it in the
 custom_variables for new leads. But ~23.5k leads were pushed to Instantly
-*before* this change. They have no industry2 server-side, so the
-{{industry2}} merge variable would render empty in templates for them.
-This script walks every linked lead and PATCHes industry2 in.
+*before* this change and have no industry2 server-side, so the
+{{industry2}} merge variable would render empty in templates.
 
-Input
------
-A JSONL file (one record per line) with at minimum:
-
-    {"instantly_lead_id": "uuid", "industry2": "Restaurant"}
-
-Rows whose `industry2` is empty/null are skipped (NULL stays NULL — the
-mapping never fabricates labels).
-
-Source of truth
----------------
-The data file is dumped directly from raw.scraped_leads via the Supabase
-MCP — see the dump query in the runbook below. We don't connect to the
-database from here so the script needs no DB credentials.
+This script enumerates Instantly directly — NOT raw.scraped_leads — to
+catch leads whose raw row lost its `instantly_lead_id` link (orphan-
+satellite drift, see BRIEF.md). For every lead with a non-empty
+`payload.industry`, we look up the canonical industry2 via the same map
+as leadgen/industry2.py and PATCH it in.
 
 Behavior
 --------
-- For each row we GET the lead from Instantly to read its current
-  custom_variables (Instantly returns them under "payload"). If
-  industry2 already equals the target value, we skip — no API call.
-- Otherwise we PATCH /leads/{id} with the merged custom_variables. Every
+- For each lead: read its current `payload` (Instantly's name for
+  custom_variables). If industry2 already equals the mapped target,
+  skip — no API call.
+- Otherwise PATCH /leads/{id} with merged custom_variables. Every
   pre-existing key (lid, industry, ticket_tier, postalCode, …) is
   preserved; only industry2 is added/overwritten.
-- 429s are retried with backoff. Failures are logged but don't abort
-  the run.
+- Industries not in our map fall through to "skip" with reason "unmapped"
+  — we never fabricate a label.
+- 429s are retried with backoff. Failures don't abort the run.
 
 Usage
 -----
     python3 backfill_industry2_to_instantly.py \\
-      --data-file /tmp/industry2_backfill_data.jsonl \\
-      [--dry-run] [--max N] [--workers 5] [--quiet]
+      [--dry-run] [--max N] [--workers 8] [--quiet]
 
-The default workers (5) matches the rest of the codebase (see
-campaign_push). Bump up if Instantly rate-limit headroom allows.
+The default workers (8) keeps API throughput high without tripping
+Instantly's rate limit. Bump up if you have headroom.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -59,7 +48,11 @@ from typing import Any
 
 import requests
 
-# ── Config ──────────────────────────────────────────────────────────────
+# Reuse the canonical map from the production module so this script and
+# the live insert-path can never diverge.
+sys.path.insert(0, str(Path(__file__).parent))
+from leadgen.industry2 import INDUSTRY2_BY_INDUSTRY, compute_industry2  # noqa: E402
+
 BASE_URL = "https://api.instantly.ai"
 
 
@@ -69,8 +62,6 @@ def _resolve_api_key() -> str:
     key = os.environ.get("INSTANTLY_API_KEY")
     if key:
         return key
-    # Fallback: parse out the API_KEY constant from enrich_lid.py without
-    # importing it (the file has top-level imports we don't need here).
     here = Path(__file__).parent
     enrich = (here / "enrich_lid.py").read_text(encoding="utf-8")
     for line in enrich.splitlines():
@@ -78,9 +69,7 @@ def _resolve_api_key() -> str:
         if line.startswith("API_KEY = "):
             quoted = line.split("=", 1)[1].strip()
             return quoted.strip('"').strip("'")
-    raise RuntimeError(
-        "INSTANTLY_API_KEY not in env and enrich_lid.py has no API_KEY constant."
-    )
+    raise RuntimeError("INSTANTLY_API_KEY not in env and enrich_lid.py has no API_KEY")
 
 
 API_KEY = _resolve_api_key()
@@ -96,7 +85,7 @@ def request_with_retry(
     backoff: float = 1.0,
     timeout: int = 30,
 ) -> requests.Response:
-    """HTTP with retry on 429 and 5xx. Same pattern as enrich_lid.py."""
+    """HTTP with retry on 429 and 5xx."""
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -125,40 +114,88 @@ def request_with_retry(
     raise RuntimeError("retry loop ended unexpectedly")
 
 
+# ── List all Instantly leads via cursor pagination ──────────────────────
+
+
+def list_all_leads(*, page_size: int = 100, max_total: int | None = None,
+                   on_progress=None) -> list[dict]:
+    """Walk every lead in the Instantly account.
+
+    POST /api/v2/leads/list with cursor `starting_after`. Returns a list
+    of lead dicts (each with id, payload, etc.). `on_progress(loaded)` is
+    called after each page so the caller can print a counter.
+    """
+    leads: list[dict] = []
+    starting_after: str | None = None
+    page = 0
+
+    while True:
+        page += 1
+        body: dict[str, Any] = {"limit": page_size}
+        if starting_after:
+            body["starting_after"] = starting_after
+
+        resp = request_with_retry("POST", f"{BASE_URL}/api/v2/leads/list",
+                                  json_payload=body)
+        if resp.status_code != 200:
+            print(f"❌ list page {page} failed: {resp.status_code} {resp.text[:200]}",
+                  file=sys.stderr)
+            break
+
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            break
+        leads.extend(items)
+        if on_progress is not None:
+            on_progress(len(leads))
+
+        if max_total is not None and len(leads) >= max_total:
+            return leads[:max_total]
+
+        next_cursor = data.get("next_starting_after")
+        if next_cursor:
+            starting_after = next_cursor
+        elif len(items) < page_size:
+            break
+        else:
+            starting_after = items[-1].get("id")
+            if not starting_after:
+                break
+
+    return leads
+
+
 # ── Per-lead worker ─────────────────────────────────────────────────────
 
 
-def _process_one(row: dict, *, dry_run: bool) -> dict:
-    """Return {lead_id, op: skip|patch|fail, reason}."""
-    lead_id = row.get("instantly_lead_id")
-    target = row.get("industry2")
-    if not lead_id or not target:
-        return {"lead_id": lead_id, "op": "skip", "reason": "no lead_id or industry2"}
+def _process_one(lead: dict, *, dry_run: bool) -> dict:
+    """Return {lead_id, op: skip|patch|fail, reason}.
 
-    # 1. Fetch current lead.
-    get_resp = request_with_retry("GET", f"{BASE_URL}/api/v2/leads/{lead_id}")
-    if get_resp.status_code == 404:
-        return {"lead_id": lead_id, "op": "skip", "reason": "404 lead gone"}
-    if get_resp.status_code != 200:
-        return {
-            "lead_id": lead_id, "op": "fail",
-            "reason": f"GET {get_resp.status_code}: {get_resp.text[:200]}",
-        }
+    `lead` is the lead dict from /leads/list — already has payload populated,
+    so we don't need a second GET.
+    """
+    lead_id = lead.get("id")
+    cv = lead.get("payload") or {}
+    if not isinstance(cv, dict):
+        cv = {}
 
-    lead = get_resp.json() or {}
-    existing_vars = lead.get("payload") or {}
-    if not isinstance(existing_vars, dict):
-        existing_vars = {}
+    industry = cv.get("industry")
+    if not industry:
+        return {"lead_id": lead_id, "op": "skip", "reason": "no industry"}
 
-    # 2. Idempotent — skip if already correct.
-    if existing_vars.get("industry2") == target:
+    target = compute_industry2(industry)
+    if not target:
+        return {"lead_id": lead_id, "op": "skip",
+                "reason": f"unmapped industry: {industry!r}"}
+
+    if cv.get("industry2") == target:
         return {"lead_id": lead_id, "op": "skip", "reason": "already set"}
 
-    # 3. PATCH with merged custom_variables.
-    merged = {**existing_vars, "industry2": target}
     if dry_run:
         return {"lead_id": lead_id, "op": "patch", "reason": "dry-run"}
 
+    merged = {**cv, "industry2": target}
     patch_resp = request_with_retry(
         "PATCH",
         f"{BASE_URL}/api/v2/leads/{lead_id}",
@@ -175,63 +212,49 @@ def _process_one(row: dict, *, dry_run: bool) -> dict:
 # ── Driver ──────────────────────────────────────────────────────────────
 
 
-def _load_rows(path: Path, max_rows: int | None) -> list[dict]:
-    rows: list[dict] = []
-    with path.open("r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            lead_id = rec.get("instantly_lead_id")
-            industry2 = rec.get("industry2")
-            if not lead_id or not industry2:
-                continue
-            rows.append({"instantly_lead_id": lead_id, "industry2": industry2})
-            if max_rows is not None and len(rows) >= max_rows:
-                break
-    return rows
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-file", required=True, type=Path,
-                    help="JSONL with {instantly_lead_id, industry2} per line")
     ap.add_argument("--dry-run", action="store_true",
                     help="GET + log only, no PATCH")
     ap.add_argument("--max", type=int, default=None,
-                    help="Stop after N candidate rows (post-load filter)")
-    ap.add_argument("--workers", type=int, default=5)
+                    help="Stop after listing N leads")
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--quiet", action="store_true",
                     help="Suppress per-batch progress lines")
     args = ap.parse_args()
 
-    if not args.data_file.exists():
-        print(f"❌ data file not found: {args.data_file}", file=sys.stderr)
-        return 2
+    print(f"🔎 Loaded {len(INDUSTRY2_BY_INDUSTRY)} industry → industry2 mappings")
+    print("📥 Listing all leads from Instantly (paged)...")
 
-    rows = _load_rows(args.data_file, args.max)
-    total = len(rows)
-    if not total:
-        print("ℹ️ No rows to process.")
+    def _on_load(n: int) -> None:
+        if not args.quiet:
+            print(f"  loaded {n} leads...", end="\r", file=sys.stderr)
+
+    listed = list_all_leads(page_size=100, max_total=args.max,
+                            on_progress=_on_load)
+    print(f"📥 Total leads listed: {len(listed)}")
+
+    if not listed:
         return 0
 
-    print(f"🚀 Backfilling industry2 on {total} Instantly leads "
-          f"(dry-run={args.dry_run}, workers={args.workers})")
+    print(f"🚀 Patching missing industry2 (dry-run={args.dry_run}, "
+          f"workers={args.workers})")
 
     counts = {"patch": 0, "skip": 0, "fail": 0}
+    skip_reasons: dict[str, int] = {}
     failures: list[dict] = []
     start = time.monotonic()
+    total = len(listed)
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {ex.submit(_process_one, r, dry_run=args.dry_run): r for r in rows}
+        futures = {ex.submit(_process_one, l, dry_run=args.dry_run): l for l in listed}
         done = 0
         for fut in as_completed(futures):
             r = fut.result()
             counts[r["op"]] = counts.get(r["op"], 0) + 1
+            if r["op"] == "skip":
+                reason = r.get("reason") or "unknown"
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
             if r["op"] == "fail":
                 failures.append(r)
             done += 1
@@ -248,6 +271,10 @@ def main() -> int:
                 )
 
     print("📊 Final counts:", counts)
+    if skip_reasons:
+        print("📊 Skip breakdown:")
+        for reason, n in sorted(skip_reasons.items(), key=lambda kv: -kv[1]):
+            print(f"  - {n}: {reason}")
     if failures:
         print(f"⚠️ {len(failures)} failures (showing up to 10):")
         for f in failures[:10]:

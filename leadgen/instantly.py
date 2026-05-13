@@ -707,6 +707,66 @@ def list_contacted_unreplied_leads(api_key, *, limit_per_page=100, log=None, on_
     return out
 
 
+def list_all_leads(api_key, *, limit_per_page=100, log=None, on_progress=None):
+    """Iterate ALL Instantly leads in the account, regardless of contact state.
+
+    Mirrors `list_contacted_unreplied_leads` but omits the `filter` parameter,
+    so the response includes every lead — not contacted, contacted, replied,
+    unsubscribed, etc. Used by the MillionVerifier prune flow which needs to
+    re-check every email currently sitting in the account.
+    """
+    if not api_key:
+        return []
+
+    def _log(msg: str) -> None:
+        if log is not None:
+            try: log(msg)
+            except Exception: pass
+
+    url = f"{BASE_URL}/api/v2/leads/list"
+    headers = _headers(api_key)
+    starting_after: str | None = None
+    out: list[dict] = []
+    page = 0
+    max_pages = 500  # ~50k leads cap; adjust if account is larger
+
+    while page < max_pages:
+        body: dict = {"limit": int(limit_per_page)}
+        if starting_after:
+            body["starting_after"] = starting_after
+        try:
+            resp = _request_with_retry("POST", url, headers=headers, json_payload=body, timeout=30)
+        except Exception as e:
+            _log(f"⚠️ list_all_leads exception: {e}")
+            break
+        if resp.status_code != 200:
+            _log(f"⚠️ list_all_leads HTTP {resp.status_code}: {resp.text[:200]}")
+            break
+        payload = resp.json()
+        items = payload.get("items", payload if isinstance(payload, list) else [])
+        if not items:
+            break
+
+        out.extend(items)
+        page += 1
+        if on_progress is not None:
+            try: on_progress(len(out))
+            except Exception: pass
+
+        next_cursor = payload.get("next_starting_after")
+        if next_cursor:
+            starting_after = next_cursor
+        elif len(items) < limit_per_page:
+            break
+        else:
+            starting_after = items[-1].get("id")
+            if not starting_after:
+                break
+
+    _log(f"📊 Listed {len(out)} total leads across {page} page(s).")
+    return out
+
+
 def bulk_move_leads_to_campaign(
     api_key, lead_ids, to_campaign_id, *, from_campaign_id, debug=False,
 ):
