@@ -21,6 +21,7 @@ from .campaign_push import (
     reconcile_unlinked_leads,
 )
 from .prune import execute_prune, preview_contacted_unreplied
+from .verify_prune import execute_verify_prune, preview_all_leads
 from .instantly import (
     _list_all_campaigns,
     find_or_create_instantly_campaign,
@@ -287,6 +288,219 @@ def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
             st.code("\n".join(last_run["log"]) or "(empty)", language="text")
         if st.button("🧹 Clear log", key="prune_clear_log_btn"):
             st.session_state.pop("prune_last_run", None)
+            st.rerun()
+
+
+def _render_verify_prune_section(backend, secrets: dict, debug: bool) -> None:
+    """Verify every Instantly lead via MillionVerifier and prune the bad ones.
+
+    Two-step UX matching the contacted-no-reply prune section:
+      1. COMPUTE COUNTS — paginate every Instantly lead, show per-industry totals.
+      2. RUN — for each candidate, hit MillionVerifier; if the status is bad
+         (invalid / disposable, plus unknown when the operator opts in),
+         delete from Instantly and soft-delete the matching raw row with
+         ``excluded_reason = 'bad_email:<status>'``.
+    """
+    st.subheader("✉️ Verify emails & prune bad ones (MillionVerifier)")
+    st.caption(
+        "Runs every Instantly lead's email through MillionVerifier. "
+        "When the result is **invalid** or **disposable** (and **unknown** "
+        "if you opt in), the lead is deleted from Instantly **and** the "
+        "matching `raw.scraped_leads` row is soft-deleted "
+        "(`excluded_at` set, `excluded_reason = bad_email:<status>` — reversible)."
+    )
+
+    api_key = secrets.get("instantly_key")
+    mv_api_key = secrets.get("millionverifier_key")
+    if not api_key:
+        st.error("Instantly API key missing.")
+        return
+    if not mv_api_key:
+        st.error("MillionVerifier API key missing — cannot verify emails.")
+        return
+
+    if st.button("📊 Compute counts (all Instantly leads)", key="verify_compute_btn"):
+        with st.status("Listing all Instantly leads…", expanded=True) as status:
+            counter_box = st.empty()
+
+            def _on_progress(loaded):
+                counter_box.write(f"Loaded {loaded} leads so far…")
+
+            preview = preview_all_leads(
+                api_key, log=status.write, on_progress=_on_progress,
+            )
+            status.write(f"✅ Total leads: {preview['total']}")
+
+        st.session_state["verify_preview"] = preview
+
+    preview = st.session_state.get("verify_preview")
+    if not preview:
+        st.info("Click **📊 Compute counts (all Instantly leads)** above to load every lead before verifying.")
+        return
+
+    st.metric("Total leads", preview["total"])
+
+    if preview["total"] == 0:
+        st.success("Nothing to verify — the Instantly account is empty.")
+        return
+
+    rows = [{"industry": ind or "(unknown)", "count": cnt}
+            for ind, cnt in preview["by_industry"]]
+    st.caption("Per-industry breakdown:")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    sample_rows = []
+    for c in preview["candidates"][:20]:
+        sample_rows.append({
+            "email": c.get("email") or "—",
+            "company": c.get("company_name") or "—",
+            "industry": (c.get("payload") or {}).get("industry", "—"),
+        })
+    if sample_rows:
+        st.caption("Sample (first 20):")
+        st.dataframe(pd.DataFrame(sample_rows), use_container_width=True, hide_index=True)
+
+    include_unknown = st.checkbox(
+        "Also delete leads where MillionVerifier returns `unknown` "
+        "(inconclusive). Off by default — a transient API hiccup would "
+        "otherwise wipe valid leads.",
+        key="verify_include_unknown",
+        value=False,
+    )
+
+    confirmed = st.checkbox(
+        f"I understand this will run MillionVerifier on {preview['total']} emails "
+        f"(billed per check) and permanently delete bad ones from Instantly "
+        f"(soft-deleted in raw, reversible).",
+        key="verify_confirm",
+    )
+
+    if st.button(
+        "✉️ Verify & prune",
+        type="primary",
+        disabled=not confirmed,
+        key="verify_run_btn",
+    ):
+        log_lines: list[str] = []
+
+        def _ts() -> str:
+            from datetime import datetime, timezone
+            return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+        with st.status("Verifying emails & pruning…", expanded=True) as status:
+            def _log(msg: str) -> None:
+                line = f"[{_ts()}] {msg}"
+                log_lines.append(line)
+                try: status.write(line)
+                except Exception: pass
+
+            progress_bar = st.progress(0.0, text="Starting…")
+
+            def _on_progress(done, total):
+                pct = min(done / total, 1.0) if total else 1.0
+                progress_bar.progress(pct, text=f"{done}/{total} verified")
+                if total and (done == total or done % max(total // 20, 1) == 0):
+                    _log(f"   • Progress: {done}/{total} verified")
+
+            result = None
+            try:
+                _log(
+                    f"Starting MillionVerifier sweep of {preview['total']} leads. "
+                    f"include_unknown_as_bad={include_unknown}."
+                )
+                result = execute_verify_prune(
+                    backend,
+                    api_key=api_key,
+                    mv_api_key=mv_api_key,
+                    candidates=preview["candidates"],
+                    debug=debug,
+                    include_unknown_as_bad=include_unknown,
+                    on_progress=_on_progress,
+                    log=_log,
+                )
+                progress_bar.progress(1.0, text="Done.")
+                _log(
+                    f"✅ Done. verified={result['verified']} "
+                    f"good={result['good']} skipped={result['skipped']} "
+                    f"bad={result['bad']} no_email={result['no_email']} "
+                    f"deleted_instantly={result['deleted_instantly']} "
+                    f"soft_deleted_raw={result['soft_deleted_raw']} "
+                    f"failed={result['failed']}"
+                )
+                if result.get("failed"):
+                    _log(f"── Failure dump ({result['failed']} leads) ──")
+                    for d in result.get("details", []):
+                        if d.get("error") and not d.get("deleted") and d.get("status") and d["status"] not in {"ok", "catch_all", "no_email"}:
+                            _log(
+                                f"   ❌ email={d.get('email') or '—'} "
+                                f"industry={d.get('industry') or '—'} "
+                                f"status={d.get('status')} "
+                                f"err={d.get('error')}"
+                            )
+            except Exception as e:
+                import traceback as _tb
+                _log(f"❌ EXCEPTION: {type(e).__name__}: {e}")
+                _log(_tb.format_exc())
+
+        st.session_state["verify_last_run"] = {
+            "log": log_lines,
+            "result": result,
+            "ran_at": _ts(),
+        }
+        # Invalidate the preview so a re-click re-fetches.
+        st.session_state.pop("verify_preview", None)
+
+    last_run = st.session_state.get("verify_last_run")
+    if last_run:
+        st.divider()
+        st.subheader("📋 Last verify-and-prune run")
+        st.caption(f"Captured at {last_run['ran_at']} UTC.")
+        result = last_run.get("result")
+        if result is not None:
+            cols1 = st.columns(4)
+            cols1[0].metric("Verified", result["verified"])
+            cols1[1].metric("Good (kept)", result["good"])
+            cols1[2].metric("Skipped (unknown)", result["skipped"])
+            cols1[3].metric("No email", result["no_email"])
+            cols2 = st.columns(4)
+            cols2[0].metric("Bad (targeted)", result["bad"])
+            cols2[1].metric("Deleted from Instantly", result["deleted_instantly"])
+            cols2[2].metric("Soft-deleted in raw", result["soft_deleted_raw"])
+            cols2[3].metric("Failed", result["failed"])
+
+            by_status = result.get("by_status") or {}
+            if by_status:
+                with st.expander("📊 Verification status breakdown", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame(
+                            sorted(
+                                ({"status": s, "count": n} for s, n in by_status.items()),
+                                key=lambda r: -r["count"],
+                            )
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            if result["failed"]:
+                err_rows = [
+                    {
+                        "email": d.get("email"),
+                        "industry": d.get("industry"),
+                        "status": d.get("status"),
+                        "error": d.get("error"),
+                    }
+                    for d in result["details"]
+                    if d.get("error") and not d.get("deleted")
+                ][:50]
+                with st.expander(f"⚠️ {result['failed']} failures", expanded=False):
+                    st.dataframe(pd.DataFrame(err_rows), use_container_width=True, hide_index=True)
+        else:
+            st.warning("Run did not finish cleanly — see log for details.")
+        with st.expander("📋 Full log (click code box top-right to copy)", expanded=True):
+            st.code("\n".join(last_run["log"]) or "(empty)", language="text")
+        if st.button("🧹 Clear log", key="verify_clear_log_btn"):
+            st.session_state.pop("verify_last_run", None)
             st.rerun()
 
 
@@ -724,6 +938,10 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
 
     # ── 1.5 Prune contacted-no-reply leads (destructive — review first) ──
     _render_prune_section(backend, secrets, debug_mode)
+    st.divider()
+
+    # ── 1.6 Verify emails via MillionVerifier and prune the bad ones ────
+    _render_verify_prune_section(backend, secrets, debug_mode)
     st.divider()
 
     # ── 2. Single-segment picker (ad-hoc) ────────────────────────────────
