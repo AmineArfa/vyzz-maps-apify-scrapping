@@ -18,6 +18,26 @@ from typing import Any
 from .ticket_tier import TIERS
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Protected campaigns — leads sitting in these Instantly campaigns must
+# never be picked up by recategorize, segment-push, or any other filter
+# path. Each entry is a hand-curated nurture / lifecycle list that we
+# never want the bulk push flows to move out of.
+#
+# To add a campaign here:
+#   1. Pull its UUID from Instantly (`list_campaigns` search).
+#   2. Append it with a comment explaining the purpose.
+#
+# Removing entries is destructive — any pending recategorize would
+# immediately become eligible to move those leads.
+PROTECTED_INSTANTLY_CAMPAIGN_IDS: tuple[str, ...] = (
+    # Vyzz — Free Audit Completers: leads who finished a public audit;
+    # they get a hand-written follow-up sequence and must not be swept
+    # into tier campaigns.
+    "54b4cd61-9cc5-4542-a6d0-5dd4764026ec",
+)
+
+
 class FilterSpecError(ValueError):
     """Raised when a filter_spec dict is malformed or has empty selectors."""
 
@@ -132,6 +152,17 @@ def build_where(
             "(instantly_campaign_id IS NULL OR instantly_campaign_id <> %s)"
         )
         params.append(exclude_already_in_campaign_id)
+
+    # Protected campaigns (Free Audit Completers, etc.) — leads sitting in
+    # these Instantly campaigns are NEVER touched by recategorize or any
+    # other filter-driven push. The clause is an unconditional invariant
+    # rather than a parameter so every caller benefits — there's no
+    # "remember to opt in" footgun.
+    if PROTECTED_INSTANTLY_CAMPAIGN_IDS:
+        parts.append(
+            "(instantly_campaign_id IS NULL OR instantly_campaign_id <> ALL(%s))"
+        )
+        params.append(list(PROTECTED_INSTANTLY_CAMPAIGN_IDS))
 
     # Soft-deleted (excluded) rows are universally invisible to downstream
     # flows — sync, recategorize, segment-push, count helpers all skip them.

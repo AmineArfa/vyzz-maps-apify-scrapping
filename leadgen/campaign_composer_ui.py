@@ -652,6 +652,12 @@ def _render_recategorize_section(backend, secrets: dict, debug: bool) -> None:
         "new leads are created with the merge fields. Leads without a tier "
         "are left untouched."
     )
+    st.info(
+        "🛡️ Protected campaigns (e.g. **Free Audit Completers**) are skipped "
+        "at the SQL filter level — recategorize will never move leads out of "
+        "them. Edit `PROTECTED_INSTANTLY_CAMPAIGN_IDS` in "
+        "`leadgen/campaign_filter.py` to add or remove campaigns."
+    )
 
     name_template = st.text_input(
         "Campaign name template",
