@@ -1,16 +1,18 @@
-"""Prune leads that were contacted but never replied.
+"""Prune leads that completed the full sequence without ever replying.
 
 Two-step flow:
 
-1. PREVIEW — paginate Instantly's `/leads/list` with FILTER_VAL_CONTACTED,
-   keep only those with `email_reply_count == 0`, group the count by the
-   `industry` custom variable so the operator sees a per-industry
-   breakdown before committing.
+1. PREVIEW — paginate Instantly's `/leads/list` with
+   FILTER_VAL_COMPLETED_NO_REPLY (lead.status == 3 Completed AND
+   email_reply_count == 0), group the count by the `industry` custom
+   variable so the operator sees a per-industry breakdown before
+   committing. Active / Paused leads still being worked through the
+   sequence are intentionally excluded.
 
 2. EXECUTE — for each candidate:
      a. DELETE /api/v2/leads/{id} on Instantly (no bulk delete in v2).
      b. Soft-delete the matching raw.scraped_leads row by setting
-        `excluded_at = now(), excluded_reason = 'contacted_no_reply'`.
+        `excluded_at = now(), excluded_reason = 'completed_no_reply'`.
         The matching key is instantly_lead_id when present, else email.
 
 Soft-delete in raw is reversible (UPDATE excluded_at = NULL). The
@@ -26,11 +28,11 @@ from typing import Any
 from .campaign_push import _classify_error
 from .instantly import (
     delete_lead_from_instantly,
-    list_contacted_unreplied_leads,
+    list_completed_unreplied_leads,
 )
 
 
-_PRUNE_REASON = "contacted_no_reply"
+_PRUNE_REASON = "completed_no_reply"
 
 
 def _industry_of(lead: dict) -> str:
@@ -47,10 +49,10 @@ def _industry_of(lead: dict) -> str:
     return "(unknown)"
 
 
-def preview_contacted_unreplied(
+def preview_completed_unreplied(
     api_key: str, *, log=None, on_progress=None,
 ) -> dict:
-    """Build a per-industry breakdown of contacted-unreplied candidates.
+    """Build a per-industry breakdown of completed-unreplied candidates.
 
     Returns:
         {
@@ -59,7 +61,7 @@ def preview_contacted_unreplied(
             "candidates": [<lead dict>, ...],         # raw Instantly objects
         }
     """
-    candidates = list_contacted_unreplied_leads(
+    candidates = list_completed_unreplied_leads(
         api_key, log=log, on_progress=on_progress,
     )
     counter: Counter[str] = Counter()
@@ -91,7 +93,7 @@ def execute_prune(
 ) -> dict:
     """Delete each candidate from Instantly + soft-delete from raw.
 
-    `candidates` is the list returned by preview_contacted_unreplied.
+    `candidates` is the list returned by preview_completed_unreplied.
     Returns counts: {deleted_instantly, soft_deleted_raw, failed}.
     """
     total = len(candidates)
