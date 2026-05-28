@@ -20,7 +20,7 @@ from .campaign_push import (
     recategorize_all_by_tier,
     reconcile_unlinked_leads,
 )
-from .prune import execute_prune, preview_contacted_unreplied
+from .prune import execute_prune, preview_completed_unreplied
 from .verify_prune import execute_verify_prune, preview_all_leads
 from .instantly import (
     _list_all_campaigns,
@@ -132,18 +132,20 @@ def _push_to_campaign(
 
 
 def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
-    """Prune leads contacted-but-never-replied.
+    """Prune leads that completed the full sequence without ever replying.
 
     Two-step UX: COMPUTE COUNTS first (paginates Instantly, shows per-industry
     breakdown), then RUN (deletes from Instantly + soft-deletes in raw).
     Preview is cached in session_state between the two clicks so the operator
     sees the same numbers they confirmed.
     """
-    st.subheader("🧹 Prune contacted-but-never-replied")
+    st.subheader("🧹 Prune completed-but-never-replied")
     st.caption(
         "Deletes leads from Instantly **and** soft-deletes the matching "
         "raw.scraped_leads row (sets `excluded_at`, reversible). Criterion: "
-        "lead was emailed at least once AND has zero replies."
+        "lead **finished every step of the sequence** (status = Completed) "
+        "AND has zero replies. Active / Paused leads still being worked "
+        "through the sequence are left untouched."
     )
 
     api_key = secrets.get("instantly_key")
@@ -152,13 +154,13 @@ def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
         return
 
     if st.button("📊 Compute counts", key="prune_compute_btn"):
-        with st.status("Listing contacted leads with no replies…", expanded=True) as status:
+        with st.status("Listing completed leads with no replies…", expanded=True) as status:
             counter_box = st.empty()
 
             def _on_progress(loaded):
                 counter_box.write(f"Loaded {loaded} candidates so far…")
 
-            preview = preview_contacted_unreplied(
+            preview = preview_completed_unreplied(
                 api_key, log=status.write, on_progress=_on_progress,
             )
             status.write(f"✅ Total candidates: {preview['total']}")
@@ -173,7 +175,7 @@ def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
     st.metric("Total candidates", preview["total"])
 
     if preview["total"] == 0:
-        st.success("Nothing to prune — every contacted lead has at least one reply.")
+        st.success("Nothing to prune — no leads have completed the sequence without replying.")
         return
 
     # Per-industry breakdown
@@ -294,7 +296,7 @@ def _render_prune_section(backend, secrets: dict, debug: bool) -> None:
 def _render_verify_prune_section(backend, secrets: dict, debug: bool) -> None:
     """Verify every Instantly lead via MillionVerifier and prune the bad ones.
 
-    Two-step UX matching the contacted-no-reply prune section:
+    Two-step UX matching the completed-no-reply prune section:
       1. COMPUTE COUNTS — paginate every Instantly lead, show per-industry totals.
       2. RUN — for each candidate, hit MillionVerifier; if the status is bad
          (invalid / disposable, plus unknown when the operator opts in),
@@ -942,7 +944,7 @@ def render(backend, secrets: dict, *, active_mode: str, debug_mode: bool) -> Non
     _render_recategorize_section(backend, secrets, debug_mode)
     st.divider()
 
-    # ── 1.5 Prune contacted-no-reply leads (destructive — review first) ──
+    # ── 1.5 Prune completed-no-reply leads (destructive — review first) ──
     _render_prune_section(backend, secrets, debug_mode)
     st.divider()
 

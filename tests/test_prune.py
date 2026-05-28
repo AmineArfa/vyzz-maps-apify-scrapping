@@ -1,4 +1,4 @@
-"""Prune flow: contacted-but-never-replied → delete from Instantly + soft-delete raw."""
+"""Prune flow: completed-but-never-replied → delete from Instantly + soft-delete raw."""
 from __future__ import annotations
 
 import sys
@@ -63,8 +63,8 @@ class PreviewTests(unittest.TestCase):
             {"id": _uuid(3), "email": "c@x.com", "payload": {"industry": "Dentist"}},
             {"id": _uuid(4), "email": "d@x.com", "payload": {}},  # unknown
         ]
-        with patch.object(prune, "list_contacted_unreplied_leads", return_value=fake_candidates):
-            preview = prune.preview_contacted_unreplied(api_key="k")
+        with patch.object(prune, "list_completed_unreplied_leads", return_value=fake_candidates):
+            preview = prune.preview_completed_unreplied(api_key="k")
         self.assertEqual(preview["total"], 4)
         # by_industry is sorted desc by count
         counts = dict(preview["by_industry"])
@@ -73,8 +73,8 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(counts["(unknown)"], 1)
 
     def test_empty_when_no_candidates(self):
-        with patch.object(prune, "list_contacted_unreplied_leads", return_value=[]):
-            preview = prune.preview_contacted_unreplied(api_key="k")
+        with patch.object(prune, "list_completed_unreplied_leads", return_value=[]):
+            preview = prune.preview_completed_unreplied(api_key="k")
         self.assertEqual(preview["total"], 0)
         self.assertEqual(preview["by_industry"], [])
 
@@ -97,7 +97,7 @@ class ExecuteTests(unittest.TestCase):
         # Soft-delete carries the right reason + flag.
         self.assertEqual(len(backend.calls), 2)
         first = backend.calls[0]
-        self.assertEqual(first["fields"]["excluded_reason"], "contacted_no_reply")
+        self.assertEqual(first["fields"]["excluded_reason"], "completed_no_reply")
         self.assertIn("excluded_at", first["fields"])
 
     def test_404_on_instantly_treated_as_already_deleted(self):
